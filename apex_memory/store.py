@@ -1039,7 +1039,7 @@ class Store:
         self._need_domain(domain)
         op = op.strip()
         if not op or op.startswith('tool:'):
-            raise Refused('bad_op', hint="op names the activity, e.g. 'ACCEPT DECISION D12'; 'tool:' is reserved")
+            raise Refused('bad_op', hint="op names the activity, e.g. 'ACCEPT DECISION D01'; 'tool:' is reserved")
         resolved = [self._resolve(p) for p in pages]
         missing = [p for p, r in zip(pages, resolved) if not self._one('SELECT 1 FROM notes WHERE path = ?', r)]
         if missing:
