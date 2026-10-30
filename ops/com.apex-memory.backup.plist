@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Nightly backup of an apex-memory store on macOS (launchd): `apex-memory backup` writes a verified copy to
+     ~/.apex-memory/backups/memory-YYYY-MM-DD.db and keeps the newest 14. The login shell finds apex-memory on your
+     PATH and reads APEX_MEMORY_URL from your profile; replace "apex-memory backup" with a full path or flags if needed.
+     Install: cp ops/com.apex-memory.backup.plist ~/Library/LaunchAgents/
+              launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.apex-memory.backup.plist
+     A run missed while the Mac sleeps runs on wake. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.apex-memory.backup</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string><string>-lc</string><string>apex-memory backup --keep 14</string>
+  </array>
+  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>0</integer></dict>
+  <key>StandardOutPath</key><string>/tmp/apex-memory-backup.log</string>
+  <key>StandardErrorPath</key><string>/tmp/apex-memory-backup.log</string>
+</dict>
+</plist>
