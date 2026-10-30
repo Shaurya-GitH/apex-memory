@@ -1,12 +1,13 @@
-"""Office AI memory store: a SQLite knowledge base used the way agents used the Obsidian KB.
+"""The memory store: a knowledge base of markdown notes for AI agents, kept in a database.
 
-Design and contracts: KB office-ai/memory/implementation-plan (D07, D11). Every write tool runs in one
-transaction: mutate -> guards -> check (any new problem rolls everything back) -> event -> commit.
-Tools return plain dicts and raise Refused for expected failures (version conflict, failed check, guard).
+Every write tool runs in one transaction: mutate -> guards -> check (any new problem rolls everything back) ->
+event -> commit. Tools return plain dicts and raise Refused for expected failures (version conflict, failed check,
+guard). The database is reached only through a backend (apex_memory.backends); the SQL here is neutral.
 """
-import collections, contextlib, datetime, functools, inspect, json, os, pathlib, re, sqlite3, threading, uuid
+import collections, contextlib, datetime, functools, inspect, json, re, threading, uuid
 
-SCHEMA = pathlib.Path(__file__).with_name('schema.sql')
+from .backends import open_backend
+
 STALE_DAYS = 14        # a verify_live source older than this is flagged
 DUP_MIN = 200          # paragraphs at least this long count as a claim for the duplicate check
 
@@ -22,8 +23,7 @@ STATUS_KINDS = {'Current state': 'state', 'Unfinished / open': 'open', 'Blockers
 ACTOR = re.compile(r'^[a-z0-9][a-z0-9-]*$')
 SOURCE_KINDS = ('snapshot', 'live', 'transcript', 'web', 'owner')
 FIXED_PAGES = ('index', 'status', 'log', 'decisions')
-NOW = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
-OPS_DOMAIN = 'memory-ops'   # the memory system's own feedback: failures and friction, logged by agents and automatically
+OPS_DOMAIN = 'memory-ops'   # default domain for the memory system's own feedback: failures and friction, logged by agents and automatically
 TRANSITIONS = {'proposed': {'accepted', 'rejected', 'superseded'}, 'accepted': {'superseded'}}
 
 
@@ -142,66 +142,48 @@ def today():
     return datetime.date.today().isoformat()
 
 
-@functools.lru_cache(maxsize=64)
-def _rx(pattern):
-    return re.compile(pattern, re.M)
-
-
-def _regexp(pattern, text):
-    return text is not None and _rx(pattern).search(text) is not None
-
-
 # ---------- the store ----------
 
 class Store:
-    def __init__(self, path, actor='unknown', role='owner', run_id: str | None = None):
+    def __init__(self, url, actor='unknown', role='owner', run_id: str | None = None, ops_domain: str = OPS_DOMAIN):
+        """url: a database URL (see apex_memory.backends) or a SQLite file path. The schema is created or
+        migrated on open. ops_domain receives automatic records of refusals and errors, when it exists."""
         # ponytail: roles are declared at registration, not authenticated (one machine, one owner)
         if role not in ('owner', 'worker') or not ACTOR.match(actor):
             raise ValueError(f'role must be owner or worker and actor a path-safe name: {role!r}, {actor!r}')
-        self.path, self.actor, self.role, self.run_id = os.path.abspath(path), actor, role, run_id or str(uuid.uuid4())
+        self.actor, self.role, self.run_id, self.ops_domain = actor, role, run_id or str(uuid.uuid4()), ops_domain
         # One connection, shared by the MCP server's worker threads: one tool call at a time per process.
-        # Processes are serialised by SQLite itself (WAL, one writer).
+        # Processes are serialised by the backend's transaction (one writer).
         self._lock = threading.RLock()
-        pathlib.Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute('PRAGMA journal_mode=WAL')
-        self.db.execute('PRAGMA busy_timeout=5000')
-        self.db.execute('PRAGMA foreign_keys=ON')
-        self.db.create_function('regexp', 2, _regexp, deterministic=True)
-        with self._write():
-            if self.db.execute('PRAGMA user_version').fetchone()[0] == 0:
-                for stmt in _statements(SCHEMA.read_text()):
-                    self.db.execute(stmt)
-                self.db.executemany('INSERT INTO meta VALUES (?, ?)',
-                                    [('store_id', str(uuid.uuid4())), ('created_at', today())])
-        self.store_id = self.db.execute("SELECT value FROM meta WHERE key='store_id'").fetchone()[0]
+        self.db = open_backend(url)
+        self.location = self.db.location
+        try:
+            with self._write():
+                if self.db.migrate():
+                    for key, value in (('store_id', str(uuid.uuid4())), ('created_at', today())):
+                        self.db.execute('INSERT INTO meta VALUES (?, ?)', (key, value))
+            self.store_id = self._one("SELECT value FROM meta WHERE key='store_id'")[0]
+        except BaseException:
+            self.db.close()
+            raise
 
     # ----- plumbing -----
 
     @contextlib.contextmanager
     def _write(self):
-        with self._lock:
-            self.db.execute('BEGIN IMMEDIATE')
-            try:
-                yield
-                self.db.execute('COMMIT')
-            except BaseException:
-                self.db.execute('ROLLBACK')
-                raise
+        with self._lock, self.db.transaction():
+            yield
 
     def _q(self, sql, *args):
-        return self.db.execute(sql, args).fetchall()
+        return self.db.query(sql, args)
 
     def _one(self, sql, *args):
-        return self.db.execute(sql, args).fetchone()
+        return self.db.one(sql, args)
 
     def _event(self, domain, op, refs=None, body=None, task_id=None, ts=None, actor=None):
-        cols = 'domain, actor, task_id, run_id, op, refs, body' + (', ts' if ts else '')
-        vals = [domain, actor or self.actor, task_id, self.run_id, op, json.dumps(refs, ensure_ascii=False), body]
-        cur = self.db.execute(f'INSERT INTO events ({cols}) VALUES ({",".join("?" * len(vals + ([ts] if ts else [])))})',
-                              vals + ([ts] if ts else []))
-        return cur.lastrowid
+        row = {'domain': domain, 'actor': actor or self.actor, 'task_id': task_id, 'run_id': self.run_id, 'op': op,
+               'refs': json.dumps(refs, ensure_ascii=False), 'body': body}
+        return self.db.insert('events', row | ({'ts': ts} if ts else {}))
 
     def _guarded(self, domain, op, task_id, mutate):
         """One write transaction: mutate, refuse on any new check problem, log a tool event."""
@@ -220,16 +202,16 @@ class Store:
         return bool(self._one("SELECT 1 FROM sections WHERE note = ? AND generated = 'catalog'", f'{domain}/index'))
 
     def _record_failure(self, tool, op, info, bound):
-        """Write a refusal or error into the memory-ops domain, if it exists. Never raises."""
+        """Write a refusal or error into the ops domain, if it exists. Never raises."""
         try:
-            if not self._one('SELECT 1 FROM notes WHERE domain = ? LIMIT 1', OPS_DOMAIN):
+            if not self._one('SELECT 1 FROM notes WHERE domain = ? LIMIT 1', self.ops_domain):
                 return
             args = {k: (f'<{len(v)} chars>' if k == 'content' or (isinstance(v, str) and len(v) > 200) else v)
                     for k, v in bound.items() if k != 'self' and v is not None}
             result = {k: v for k, v in info.items() if k != 'content'}
             body = json.dumps({'tool': tool, 'args': args, 'result': result}, ensure_ascii=False, default=str)[:4000]
             with self._write():
-                self._event(OPS_DOMAIN, op, {'tool': tool, 'error': result.get('error')}, body)
+                self._event(self.ops_domain, op, {'tool': tool, 'error': result.get('error')}, body)
         except Exception:
             pass
 
@@ -259,7 +241,7 @@ class Store:
 
     def _check_leases(self, section_ids):
         ids = list(section_ids)
-        r = self._one(f'SELECT * FROM leases WHERE section IN ({",".join("?" * len(ids))}) AND run_id != ? AND expires_at > {NOW}',
+        r = self._one(f'SELECT * FROM leases WHERE section IN ({",".join("?" * len(ids))}) AND run_id != ? AND expires_at > {self.db.now()}',
                       *ids, self.run_id) if ids else None
         if r:
             raise Refused('leased', section_id=r['section'], holder=r['actor'], expires_at=local(r['expires_at']),
@@ -322,10 +304,10 @@ class Store:
         if self._one('SELECT 1 FROM notes WHERE path = ?', t):
             return t
         if '/' in t and t.split('/')[0] not in self._domains():
-            return t  # another domain (e.g. porter/… still on Obsidian): external, never matched by file name
+            return t  # a domain not in this store: external, never matched by file name
         name = t.rsplit('/', 1)[-1]
-        rows = self._q('SELECT path FROM notes WHERE lower(path) = lower(?) OR lower(substr(path, -?)) = lower(?)',
-                       name, len(name) + 1, '/' + name)
+        rows = self._q("SELECT path FROM notes WHERE lower(path) = lower(?) OR lower(path) LIKE lower(?) ESCAPE '!'",
+                       name, '%/' + _like(name))
         return rows[0]['path'] if len(rows) == 1 else t
 
     def _anchor_section(self, dst, anchor):
@@ -350,14 +332,16 @@ class Store:
                 body = (header_line(n) if n['decision_status'] is not None else '') + body
             for target, anchor in links_in(body):
                 dst = self._resolve(target)
-                self.db.execute('INSERT OR IGNORE INTO links VALUES (?, ?, ?, ?)',
-                                (sid, dst, anchor, self._anchor_section(dst, anchor) if anchor else None))
+                if not self._one('SELECT 1 FROM links WHERE src_section = ? AND dst = ? AND anchor = ?', sid, dst, anchor):
+                    self.db.execute('INSERT INTO links VALUES (?, ?, ?, ?)',
+                                    (sid, dst, anchor, self._anchor_section(dst, anchor) if anchor else None))
 
     def _resolve_dangling(self, note):
         """Re-resolve links into a note after it changed: every anchor (a ^block can leave a surviving section), and
         links still waiting under a short name or the full path for a note that now exists."""
-        for l in self._q("SELECT rowid, dst, anchor FROM links WHERE dst = ? AND anchor != ''", note):
-            self.db.execute('UPDATE links SET dst_section = ? WHERE rowid = ?', (self._anchor_section(l['dst'], l['anchor']), l['rowid']))
+        for l in self._q("SELECT src_section, dst, anchor FROM links WHERE dst = ? AND anchor != ''", note):
+            self.db.execute('UPDATE links SET dst_section = ? WHERE src_section = ? AND dst = ? AND anchor = ?',
+                            (self._anchor_section(l['dst'], l['anchor']), l['src_section'], l['dst'], l['anchor']))
         waiting = self._q('SELECT DISTINCT src_section FROM links WHERE dst NOT IN (SELECT path FROM notes) AND lower(dst) IN (lower(?), lower(?))',
                           note.rsplit('/', 1)[-1], note)
         self._relink([r[0] for r in waiting])
@@ -372,7 +356,7 @@ class Store:
         domain = s['note'].split('/')[0]
         if g == 'catalog':
             rows = self._q("SELECT path, summary FROM notes WHERE domain = ? AND summary IS NOT NULL AND path NOT LIKE domain || '/working/%' "
-                           'ORDER BY catalog_position, path', domain)
+                           'ORDER BY coalesce(catalog_position, 0), path', domain)
             return body + ''.join(f"| [[{r['path']}]] | {r['summary']} |\n" for r in rows) + '\n'
         if g.startswith('status:'):
             items = self._q('SELECT text FROM status_items WHERE domain = ? AND kind = ? AND closed_at IS NULL '
@@ -421,8 +405,9 @@ class Store:
             if len(r['status']) == 1:
                 value, by = r['status'][0]
                 d = DATE.search(r['title'])
-                self.db.execute('INSERT OR IGNORE INTO decisions VALUES (?, ?, ?, ?, ?, ?, ?)',
-                                (domain, r['id'], r['title'], value.split()[0], r['section']['id'], d and d.group(), by or None))
+                if not self._one('SELECT 1 FROM decisions WHERE domain = ? AND id = ?', domain, r['id']):  # the first record of an id wins
+                    self.db.execute('INSERT INTO decisions VALUES (?, ?, ?, ?, ?, ?, ?)',
+                                    (domain, r['id'], r['title'], value.split()[0], r['section']['id'], d and d.group(), by or None))
 
     def _guard_records(self, before, domain):
         after = {r['id']: r for r in self._records(domain)}
@@ -507,10 +492,10 @@ class Store:
         if not self._catalog_generated(domain):  # index kept as written: show notes it does not mention
             extra = self._q("SELECT path, summary FROM notes n WHERE domain = ? AND summary IS NOT NULL AND path NOT LIKE domain || '/working/%' "
                             'AND NOT EXISTS (SELECT 1 FROM links l JOIN sections s ON s.id = l.src_section WHERE s.note = ? AND l.dst = n.path) '
-                            'ORDER BY catalog_position, path', domain, f'{domain}/index')
+                            'ORDER BY coalesce(catalog_position, 0), path', domain, f'{domain}/index')
             if extra:
                 index += '\n\n===== notes not mentioned on the index page\n' + '\n'.join(f"- [[{r['path']}]] {r['summary']}" for r in extra)
-        prose = self._one(f'SELECT 1 FROM notes WHERE path = ?', f'{domain}/status') and not self._one(
+        prose = self._one('SELECT 1 FROM notes WHERE path = ?', f'{domain}/status') and not self._one(
             'SELECT 1 FROM sections WHERE note = ? AND generated IS NOT NULL', f'{domain}/status')
         status = '\n'.join(['===== owner preferences', '\n'.join(f"- [#{r['id']}] {r['text']} (owner: \"{r['owner_quote']}\")" for r in prefs) or 'none',
                             *(['===== your working notes', '\n'.join(r['path'] for r in mine)] if mine else []),
@@ -518,35 +503,29 @@ class Store:
                             '===== open status items', '\n'.join(f"- [#{i['id']} {i['kind']}] {i['text']}" for i in items) or 'none',
                             *(['===== status page', self.render_note(f'{domain}/status', frontmatter=False).strip()] if prose else [])])
         text = '\n'.join([
-            f'store {self.store_id} at {self.path} · domain {domain} · you are {self.actor} ({self.role})',
+            f'store {self.store_id} at {self.location} · domain {domain} · you are {self.actor} ({self.role})',
             f'check: {len(self.problems(domain))} open problems (run check for the list)',
             '===== index', _cap(index, max_chars), _cap(status, max_chars),
             f'===== last {len(events)} log entries', ''.join(self._entry(e) for e in reversed(events)).strip()])
-        return {'ok': True, 'store_id': self.store_id, 'db': self.path, 'brief': text,
+        return {'ok': True, 'store_id': self.store_id, 'db': self.location, 'brief': text,
                 'truncated': len(index) > max_chars or len(status) > max_chars}
 
-    def search(self, query: str, mode: str = 'bm25', scope: str = 'office-ai', limit: int = 10) -> dict:
+    def search(self, query: str, mode: str = 'bm25', scope: str = '', limit: int = 10) -> dict:
         """Search note titles and summaries, sections and log entries. mode: 'bm25' (ranked keywords), 'exact'
         (substring, e.g. ids and hashes) or 'regex' (Python syntax). scope: a domain or folder such as
-        'office-ai/memory'. Hits carry path, section id, heading path, version and a snippet."""
+        'project/docs'; empty searches every domain. Hits carry path, section id, heading path, version and a snippet."""
         scope = scope.strip('/')
-        domain, like = scope.split('/')[0], scope + '/%'
-        inscope = '(n.path = ? OR n.path LIKE ?)'
+        domain = scope.split('/')[0] or None
+        inscope, args = ('(t.{0} = ? OR t.{0} LIKE ?)', (scope, scope + '/%')) if scope else ('1 = 1', ())
+        log, log_args = ("t.op NOT LIKE 'tool:%' AND t.domain = ?", (domain,)) if domain else ("t.op NOT LIKE 'tool:%'", ())
         hits = []
         if mode == 'bm25':
-            q = ' OR '.join('"%s"' % t for t in re.findall(r'\w+', query))
-            if q:
-                for r in self._q(f"SELECT n.path, n.version, bm25(notes_fts, 4.0, 2.0) AS score, snippet(notes_fts, -1, '[', ']', '…', 12) AS snip "
-                                 f'FROM notes_fts JOIN notes n ON n.id = notes_fts.rowid WHERE notes_fts MATCH ? AND {inscope}', q, scope, like):
-                    hits.append({'kind': 'note', 'path': r['path'], 'version': r['version'], 'snippet': r['snip'], 'score': r['score']})
-                for r in self._q(f"SELECT s.*, bm25(sections_fts, 3.0, 1.0) AS score, snippet(sections_fts, -1, '[', ']', '…', 12) AS snip "
-                                 f'FROM sections_fts JOIN sections s ON s.id = sections_fts.rowid JOIN notes n ON n.path = s.note '
-                                 f'WHERE sections_fts MATCH ? AND {inscope}', q, scope, like):
-                    hits.append(self._hit(r, r['snip'], r['score']))
-                for r in self._q("SELECT e.*, bm25(events_fts, 2.0, 1.0) AS score, snippet(events_fts, -1, '[', ']', '…', 12) AS snip "
-                                 "FROM events_fts JOIN events e ON e.id = events_fts.rowid WHERE events_fts MATCH ? AND e.domain = ? "
-                                 "AND e.op NOT LIKE 'tool:%'", q, domain):
-                    hits.append({'kind': 'event', 'event_id': r['id'], 'ts': local(r['ts']), 'op': r['op'], 'snippet': r['snip'], 'score': r['score']})
+            for r in self.db.search('notes', query, inscope.format('path'), args):
+                hits.append({'kind': 'note', 'path': r['path'], 'version': r['version'], 'snippet': r['snippet'], 'score': r['score']})
+            for r in self.db.search('sections', query, inscope.format('note'), args):
+                hits.append(self._hit(r, r['snippet'], r['score']))
+            for r in self.db.search('events', query, log, log_args):
+                hits.append({'kind': 'event', 'event_id': r['id'], 'ts': local(r['ts']), 'op': r['op'], 'snippet': r['snippet'], 'score': r['score']})
             hits.sort(key=lambda h: h['score'])
         elif mode in ('exact', 'regex'):
             if mode == 'regex':
@@ -554,26 +533,21 @@ class Store:
                     rx = re.compile(query, re.M)
                 except re.error as e:
                     raise Refused('bad_regex', detail=str(e))
-                cond, args = 'regexp(?, s.body)', [query]
-                find = lambda text: rx.search(text)
+                rows = self._q(f'SELECT t.* FROM sections t WHERE {self.db.regex("t.body")} AND {inscope.format("note")}', query, *args)
             else:
-                if len(query) >= 3:  # the trigram index, like the fallback below, is case-insensitive
-                    cond, args = 's.id IN (SELECT rowid FROM sections_exact WHERE sections_exact MATCH ?)', ['"' + query.replace('"', '""') + '"']
-                else:
-                    cond, args = 'instr(lower(s.body), lower(?)) > 0', [query]
                 rx = re.compile(re.escape(query), re.I)
-                find = lambda text: rx.search(text)
-            for r in self._q(f'SELECT s.* FROM sections s JOIN notes n ON n.path = s.note WHERE {cond} AND {inscope} '
-                             f'ORDER BY s.note, s.position', *args, scope, like):
-                hits.append(self._hit(r, _snip(r['body'], find(r['body']))))
-            for r in self._q(f"SELECT * FROM events WHERE domain = ? AND op NOT LIKE 'tool:%' ORDER BY id", domain):
-                m = find(r['body'] or '')
+                rows = self.db.search('sections', query, inscope.format('note'), args, exact=True)
+            for r in sorted(rows, key=lambda r: (r['note'], r['position'])):
+                hits.append(self._hit(r, _snip(r['body'], rx.search(r['body']))))
+            for r in self._q(f'SELECT * FROM events t WHERE {log} ORDER BY id', *log_args):
+                m = rx.search(r['body'] or '')
                 if m:
                     hits.append({'kind': 'event', 'event_id': r['id'], 'ts': local(r['ts']), 'op': r['op'], 'snippet': _snip(r['body'], m)})
         else:
             raise Refused('bad_mode', mode=mode, modes=['bm25', 'exact', 'regex'])
-        own, in_working = f'{domain}/working/{self.actor}/', scope.startswith(f'{domain}/working')
-        hits = [h for h in hits if in_working or 'path' not in h or not self._is_working(h['path']) or h['path'].startswith(own)][:limit]
+        in_working = scope.split('/')[1:2] == ['working']
+        hits = [h for h in hits if in_working or 'path' not in h or not self._is_working(h['path'])
+                or h['path'].startswith(f"{h['path'].split('/')[0]}/working/{self.actor}/")][:limit]
         with self._write():
             self._event(domain, 'tool:search', [h.get('section_id') or h.get('path') or h.get('event_id') for h in hits],
                         json.dumps({'query': query, 'mode': mode, 'scope': scope, 'hits': len(hits)}, ensure_ascii=False))
@@ -688,10 +662,10 @@ class Store:
                     changed.append(r['id'])
                 order.append(r['id'])
             else:
-                cur = self.db.execute('INSERT INTO sections (note, heading, heading_path, level, position, body) VALUES (?, ?, ?, ?, -1, ?)',
-                                      (t['note'], c['heading'], key, c['level'], c['body']))
-                changed.append(cur.lastrowid)
-                order.append(cur.lastrowid)
+                sid = self.db.insert('sections', {'note': t['note'], 'heading': c['heading'], 'heading_path': key, 'level': c['level'],
+                                                  'position': -1, 'body': c['body']})
+                changed.append(sid)
+                order.append(sid)
         for r in old.values():
             self.db.execute('DELETE FROM sections WHERE id = ?', (r['id'],))
             changed.append(r['id'])
@@ -750,12 +724,11 @@ class Store:
 
     def _insert_sections(self, note, preamble, secs, generated=None):
         generated = generated or {}
-        ids = [self.db.execute("INSERT INTO sections (note, heading, heading_path, level, position, body) VALUES (?, NULL, '[]', NULL, 0, ?)",
-                               (note, preamble)).lastrowid]
+        ids = [self.db.insert('sections', {'note': note, 'heading_path': '[]', 'position': 0, 'body': preamble})]
         for i, s in enumerate(secs, 1):
             g, body = generated.get(i - 1, (None, s['body']))
-            ids.append(self.db.execute('INSERT INTO sections (note, heading, heading_path, level, position, body, generated) '
-                                       'VALUES (?, ?, ?, ?, ?, ?, ?)', (note, s['heading'], hp(s['path']), s['level'], i, body, g)).lastrowid)
+            ids.append(self.db.insert('sections', {'note': note, 'heading': s['heading'], 'heading_path': hp(s['path']), 'level': s['level'],
+                                                   'position': i, 'body': body, 'generated': g}))
         return ids
 
     def patch_header(self, path: str, if_version: int, decision_status: str | None = None, impl_status: str | None = None,
@@ -804,8 +777,8 @@ class Store:
                 if kind not in STATUS_KINDS.values() or not (text or '').strip():
                     raise Refused('bad_item', kinds=list(STATUS_KINDS.values()), hint='add needs a kind and text')
                 pos = self._one('SELECT coalesce(max(position), 0) + 1 FROM status_items WHERE domain = ? AND kind = ?', domain, kind)[0]
-                iid = self.db.execute('INSERT INTO status_items (domain, kind, text, refs, position, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
-                                      (domain, kind, text.strip(), json.dumps(refs or []), pos, today())).lastrowid
+                iid = self.db.insert('status_items', {'domain': domain, 'kind': kind, 'text': text.strip(), 'refs': json.dumps(refs or []),
+                                                      'position': pos, 'updated_at': today()})
                 return {'item_id': iid}, {'item': iid}, json.dumps({'action': 'add', 'kind': kind, 'text': text}, ensure_ascii=False)
             if action == 'close':
                 it = self._one('SELECT * FROM status_items WHERE id = ? AND domain = ?', item_id, domain)
@@ -864,7 +837,7 @@ class Store:
                     if direction not in (side, 'both'):
                         continue
                     for r in self._q('SELECT l.*, s.note, s.heading, (SELECT 1 FROM notes WHERE path = l.dst) AS found FROM links l '
-                                     f'JOIN sections s ON s.id = l.src_section WHERE {col} = ? ORDER BY s.note, s.position', p):
+                                     f'JOIN sections s ON s.id = l.src_section WHERE {col} = ? ORDER BY s.note, s.position, l.dst, l.anchor', p):
                         external = not r['found'] and '/' in r['dst'] and r['dst'].split('/')[0] not in domains
                         broken = (not r['found'] and not external) or bool(r['found'] and r['anchor'] and r['dst_section'] is None)
                         out.setdefault((r['src_section'], r['dst'], r['anchor']), {
@@ -891,15 +864,17 @@ class Store:
                 conds.append(f'ts {cmp} ?')
                 args.append(_utc(value, end))
         if op:
-            conds.append('instr(lower(op), lower(?)) > 0')
-            args.append(op)
-        if page:
-            conds.append('EXISTS (SELECT 1 FROM json_tree(events.refs) WHERE value = ?)')
-            args.append(self._resolve(page))
+            conds.append("lower(op) LIKE lower(?) ESCAPE '!'")
+            args.append('%' + _like(op) + '%')
         if task_id:
             conds.append('task_id = ?')
             args.append(task_id)
-        rows = self._q(f'SELECT * FROM events WHERE {" AND ".join(conds)} ORDER BY id DESC LIMIT ?', *args, limit)
+        sql = f'SELECT * FROM events WHERE {" AND ".join(conds)} ORDER BY id DESC'
+        if page:  # ponytail: matches refs in Python over the filtered log; a refs table if logs grow very large
+            want = self._resolve(page)
+            rows = [e for e in self._q(sql, *args) if want in _strings(json.loads(e['refs'] or 'null'))][:limit]
+        else:
+            rows = self._q(sql + ' LIMIT ?', *args, limit)
         return {'ok': True, 'entries': [{'event_id': e['id'], 'ts': local(e['ts']), 'op': e['op'], 'actor': e['actor'],
                                          'task_id': e['task_id'], 'run_id': e['run_id'],
                                          'text': self._entry(e) if not e['op'].startswith('tool:') else e['body']}
@@ -989,15 +964,15 @@ class Store:
                 self._need_owner('record a preference')
                 if not (text or '').strip() or not (owner_quote or '').strip():
                     raise Refused('quote_required', hint="a preference needs its text and the owner's own words")
-                iid = self.db.execute('INSERT INTO preferences (domain, text, owner_quote, recorded_by, run_id) VALUES (?, ?, ?, ?, ?)',
-                                      (domain or None, text.strip(), owner_quote.strip(), self.actor, self.run_id)).lastrowid
+                iid = self.db.insert('preferences', {'domain': domain or None, 'text': text.strip(), 'owner_quote': owner_quote.strip(),
+                                                     'recorded_by': self.actor, 'run_id': self.run_id})
                 return {'item_id': iid}, {'preference': iid}, json.dumps({'action': 'add', 'text': text}, ensure_ascii=False)
             if action == 'retire':
                 self._need_owner('retire a preference')
                 r = self._one('SELECT * FROM preferences WHERE id = ? AND retired_at IS NULL', item_id)
                 if not r:
                     raise Refused('not_active', item_id=item_id)
-                self.db.execute(f'UPDATE preferences SET retired_at = {NOW} WHERE id = ?', (item_id,))
+                self.db.execute(f'UPDATE preferences SET retired_at = {self.db.now()} WHERE id = ?', (item_id,))
                 return {'item_id': item_id}, {'preference': item_id}, json.dumps({'action': 'retire', 'text': r['text']}, ensure_ascii=False)
             raise Refused('bad_action', actions=['add', 'retire'])
 
@@ -1017,17 +992,18 @@ class Store:
             if action == 'add':
                 if kind not in SOURCE_KINDS or not (ref or '').strip():
                     raise Refused('bad_source', kinds=list(SOURCE_KINDS), hint='add needs kind and ref')
+                values = (kind, ref, captured_at or today(), int(verify_live), id)
                 if self._one('SELECT 1 FROM sources WHERE id = ?', id):
                     self._need_owner('update an existing source')
-                self.db.execute('INSERT INTO sources (id, kind, ref, captured_at, verify_live) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE '
-                                'SET kind = excluded.kind, ref = excluded.ref, captured_at = excluded.captured_at, verify_live = excluded.verify_live',
-                                (id, kind, ref, captured_at or today(), int(verify_live)))
+                    self.db.execute('UPDATE sources SET kind = ?, ref = ?, captured_at = ?, verify_live = ? WHERE id = ?', values)
+                else:
+                    self.db.execute('INSERT INTO sources (kind, ref, captured_at, verify_live, id) VALUES (?, ?, ?, ?, ?)', values)
             elif action not in ('cite', 'uncite'):
                 raise Refused('bad_action', actions=['add', 'cite', 'uncite'])
             elif not self._one('SELECT 1 FROM sources WHERE id = ?', id) or not path:
                 raise Refused('not_found', source=id, hint='cite and uncite need an existing source and a path')
-            if path and action in ('add', 'cite'):
-                self.db.execute('INSERT OR IGNORE INTO note_sources VALUES (?, ?)', (path, id))
+            if path and action in ('add', 'cite') and not self._one('SELECT 1 FROM note_sources WHERE note = ? AND source = ?', path, id):
+                self.db.execute('INSERT INTO note_sources VALUES (?, ?)', (path, id))
             if action == 'uncite':
                 self.db.execute('DELETE FROM note_sources WHERE note = ? AND source = ?', (path, id))
             return {'source': id, 'path': path}, {'source': id, 'note': path}, json.dumps({'action': action}, ensure_ascii=False)
@@ -1046,10 +1022,10 @@ class Store:
             if action == 'take':
                 self._check_leases([r['id'] for r in self._subtree(t) + self._ancestors(t)])
                 m = max(1, min(int(minutes), 60))
-                self.db.execute(f"INSERT OR REPLACE INTO leases VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+{m} minutes'))",
-                                (t['id'], self.actor, self.run_id))
+                self.db.execute('DELETE FROM leases WHERE section = ?', (t['id'],))  # an expired lease or our own
+                self.db.execute(f'INSERT INTO leases VALUES (?, ?, ?, {self.db.now(m)})', (t['id'], self.actor, self.run_id))
             elif action == 'release':
-                if not self.db.execute('DELETE FROM leases WHERE section = ? AND run_id = ?', (t['id'], self.run_id)).rowcount:
+                if not self.db.execute('DELETE FROM leases WHERE section = ? AND run_id = ?', (t['id'], self.run_id)):
                     raise Refused('not_held', section_id=t['id'])
             else:
                 raise Refused('bad_action', actions=['take', 'release'])
@@ -1088,24 +1064,24 @@ def _cap(text, limit):
     return text if len(text) <= limit else text[:limit] + f'\n… [truncated at {limit} of {len(text)} chars; read by section]'
 
 
+def _like(text):
+    """text as a literal LIKE pattern (ESCAPE '!')."""
+    return re.sub(r'([!%_])', r'!\1', text)
+
+
+def _strings(value):
+    """Every string in a JSON value, at any depth."""
+    if isinstance(value, str):
+        return [value]
+    items = value.values() if isinstance(value, dict) else value if isinstance(value, list) else []
+    return [s for v in items for s in _strings(v)]
+
+
 def _snip(text, m, width=80):
     if not m:
         return ''
     a, b = max(0, m.start() - width), min(len(text), m.end() + width)
     return ('…' if a else '') + text[a:m.start()] + '[' + text[m.start():m.end()] + ']' + text[m.end():b] + ('…' if b < len(text) else '')
-
-
-def _statements(sql):
-    """Split schema.sql into statements (trigger bodies contain ';')."""
-    out, buf = [], ''
-    for line in sql.splitlines(keepends=True):
-        if line.lstrip().startswith('--') and not buf.strip():
-            continue
-        buf += line
-        if sqlite3.complete_statement(buf):
-            out.append(buf.strip())
-            buf = ''
-    return [s for s in out if s]
 
 
 TOOLS = ['brief', 'search', 'read', 'links', 'log_query', 'patch_section', 'patch_header', 'create_note', 'move', 'status_item',
@@ -1143,24 +1119,3 @@ for _name in TOOLS:
     setattr(Store, _name, _locked(getattr(Store, _name), capture=True))
 Store.render_note = _locked(Store.render_note, capture=False)
 
-
-def backup(db, to_dir, keep=14):
-    """VACUUM INTO a dated copy, verify it with integrity_check, keep the newest `keep` copies."""
-    to = pathlib.Path(to_dir).expanduser()
-    to.mkdir(parents=True, exist_ok=True)
-    final = to / f'memory-{today()}.db'
-    tmp = to / f'.{final.name}.tmp'
-    tmp.unlink(missing_ok=True)
-    src = sqlite3.connect(db)
-    src.execute('VACUUM INTO ?', (str(tmp),))
-    src.close()
-    copy = sqlite3.connect(tmp)
-    ok = copy.execute('PRAGMA integrity_check').fetchone()[0]
-    copy.close()
-    if ok != 'ok':
-        tmp.unlink()
-        raise RuntimeError(f'backup failed integrity_check: {ok}')
-    os.replace(tmp, final)
-    for old in sorted(to.glob('memory-*.db'))[:-keep]:
-        old.unlink()
-    return final

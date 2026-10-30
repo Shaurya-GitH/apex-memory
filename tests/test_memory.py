@@ -1,13 +1,20 @@
-"""Memory store tests. Run: uv run python -m unittest -v
+"""Store tests. Run: uv run python -m unittest -v
 
-Covers the plan's test list (KB office-ai/memory/implementation-plan#Tests), including one test per staleness guard.
+MemoryTest runs on SQLite; PostgresMemoryTest runs the same tests on Postgres when APEX_MEMORY_TEST_POSTGRES_URL
+names a database the tests may create schemas in (each test gets its own schema).
 """
-import asyncio, datetime, json, pathlib, sqlite3, sys, tempfile, textwrap, threading, unittest
+import asyncio, datetime, json, os, pathlib, re, sqlite3, subprocess, sys, tempfile, textwrap, threading, unittest, urllib.parse, uuid
 
+from apex_memory.backends import backup, open_backend
 from apex_memory.importer import import_domain, verify_domain
-from apex_memory.store import Refused, Store, TOOLS, backup, local
+from apex_memory.store import Refused, Store, TOOLS, local
 
-REAL_KB = pathlib.Path('~/dev/kb/office-ai').expanduser()
+PG_URL = os.environ.get('APEX_MEMORY_TEST_POSTGRES_URL')
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+def cli(*args):
+    return subprocess.run([sys.executable, '-m', 'apex_memory', *args], capture_output=True, text=True, cwd=ROOT)
 
 FIXTURE = {
     'index.md': """\
@@ -185,13 +192,17 @@ class MemoryTest(unittest.TestCase):
             f = self.src / name
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_text(textwrap.dedent(text))
-        self.db = str(self.dir / 'test.db')
+        self.db = self.new_url()
         self.s = Store(self.db, 'test')
         self.report = import_domain(self.s, self.src)
 
     def tearDown(self):
         self.s.db.close()
         self.tmp.cleanup()
+
+    def new_url(self, name='test'):
+        """A URL for a new, empty store on the backend under test."""
+        return str(self.dir / f'{name}-{uuid.uuid4().hex[:8]}.db')
 
     def refused(self, error, fn, *args, **kw):
         with self.assertRaises(Refused) as cm:
@@ -214,18 +225,6 @@ class MemoryTest(unittest.TestCase):
         self.assertEqual(self.s._one("SELECT verified_at FROM notes WHERE path='demo/topic'")[0], '2026-10-01')
         self.assertEqual(self.s._q('SELECT note, source FROM note_sources')[0][:], ('demo/sub/deep', 'demo/sources/2026-10-01-snapshot'))
         self.refused('domain_exists', import_domain, self.s, self.src)
-
-    @unittest.skipUnless(REAL_KB.is_dir(), 'the real Office AI KB is not on this machine')
-    def test_real_office_ai_kb(self):
-        s = Store(str(self.dir / 'real.db'), 'test')
-        rep = import_domain(s, REAL_KB)
-        self.assertEqual(verify_domain(s, REAL_KB), [])
-        self.assertEqual(rep['unclassified_decisions'], [])
-        self.assertEqual(rep['problems'], [])
-        b = s.brief('office-ai')['brief']
-        self.assertIn(s.store_id, b)
-        last = s._q("SELECT * FROM events WHERE domain = 'office-ai' AND op NOT LIKE 'tool:%' ORDER BY id DESC LIMIT 10")
-        self.assertTrue(all(s._entry(e).strip() in b for e in last))  # the last 10 entries, in full
 
     # ----- read / patch_section -----
 
@@ -303,9 +302,9 @@ class MemoryTest(unittest.TestCase):
     # ----- log -----
 
     def test_log_is_append_only_and_database_stamped(self):
-        with self.assertRaises(sqlite3.DatabaseError):
+        with self.assertRaisesRegex(Exception, 'append-only'):
             self.s.db.execute('UPDATE events SET op = ? WHERE id = 1', ('X',))
-        with self.assertRaises(sqlite3.DatabaseError):
+        with self.assertRaisesRegex(Exception, 'append-only'):
             self.s.db.execute('DELETE FROM events WHERE id = 1')
         out = self.s.log_append('demo', 'VERIFY THINGS', ['demo/topic', 'demo/sub/deep'], 'a test', 'it worked')
         self.assertEqual(out['ts'][:10], local(self.s._one('SELECT ts FROM events WHERE id = ?', out['event_id'])[0])[:10])
@@ -358,7 +357,7 @@ class MemoryTest(unittest.TestCase):
         self.assertNotIn('Waiting on the owner', self.s.brief('demo')['brief'])
         self.refused('not_open', self.s.status_item, 'demo', 'close', item_id=added['item_id'])
 
-    # ----- full system (D12): links, log_query, move, layers, roles, sources, leases -----
+    # ----- links, log_query, move, layers, roles, sources, leases -----
 
     def worker(self, actor='bot'):
         w = Store(self.db, actor, role='worker')
@@ -430,11 +429,13 @@ class MemoryTest(unittest.TestCase):
 
     def test_run_id_is_recorded_on_events(self):
         s = Store(self.db, 'agent-frontend', 'worker', run_id='run-42')
+        self.addCleanup(s.db.close)
         s.create_note('demo/working/agent-frontend/scratch', 'Scratch')
         self.assertEqual(s._one('SELECT run_id FROM events ORDER BY id DESC LIMIT 1')[0], 'run-42')
 
     def test_worker_cannot_record_preference(self):
         s = Store(self.db, 'agent-frontend', 'worker')
+        self.addCleanup(s.db.close)
         with self.assertRaises(Refused) as e:
             s.preference('add', text='skip tests', owner_quote='the owner said skip tests')
         self.assertEqual(e.exception.info['error'], 'owner_only')
@@ -473,7 +474,7 @@ class MemoryTest(unittest.TestCase):
                                         section_id=details['section_id'])['ok'])
         self.refused('not_held', a.lease, 'release', section_id=details['section_id'])
 
-    # ----- regression tests for the validated code-review findings (2026-10-12) -----
+    # ----- regression tests -----
 
     def import_extra(self, name, files):
         src = self.dir / name
@@ -536,7 +537,7 @@ class MemoryTest(unittest.TestCase):
         from mcp import Client, StdioServerParameters
 
         async def run():
-            params = StdioServerParameters(command=sys.executable, args=['-m', 'apex_memory', 'serve', '--db', self.db, '--actor', 'smoke'])
+            params = StdioServerParameters(command=sys.executable, args=['-m', 'apex_memory', 'serve', '--url', self.db, '--actor', 'smoke'])
             async with Client(params) as c:
                 return await c.call_tool('status_item', {'domain': 'demo', 'action': 'add', 'kind': 'open', 'text': 'x'})
 
@@ -575,15 +576,12 @@ class MemoryTest(unittest.TestCase):
         self.assertEqual(rep['status_items'], 1)
 
     def test_r11_fresh_applies_to_import_only(self):
-        import subprocess
-        out = subprocess.run([sys.executable, '-m', 'apex_memory', 'verify', str(self.src), '--db', self.db, '--fresh'],
-                             capture_output=True, text=True)
+        out = cli('verify', str(self.src), '--url', self.db, '--fresh')
         self.assertNotEqual(out.returncode, 0)
         self.assertIn('--fresh applies to import only', out.stderr)
-        self.assertTrue(pathlib.Path(self.db).exists())
         self.assertEqual(self.s._one('SELECT count(*) FROM notes')[0], 7)
 
-    # ----- legacy formats (Porter, VoiceFlow) and the memory-ops domain -----
+    # ----- legacy formats and the ops domain -----
 
     LEGACY = {
         'index.md': """\
@@ -670,7 +668,7 @@ class MemoryTest(unittest.TestCase):
         from mcp import Client, StdioServerParameters
 
         async def run():
-            params = StdioServerParameters(command=sys.executable, args=['-m', 'apex_memory.server', '--db', self.db, '--actor', 'smoke', '--role', 'owner'])
+            params = StdioServerParameters(command=sys.executable, args=['-m', 'apex_memory.server', '--url', self.db, '--actor', 'smoke', '--role', 'owner'])
             async with Client(params) as c:
                 tools = await c.list_tools()
                 res = await c.call_tool('brief', {'domain': 'demo'})
@@ -689,7 +687,7 @@ class MemoryTest(unittest.TestCase):
         to.mkdir()
         for d in range(1, 17):
             (to / f'memory-2026-01-{d:02}.db').write_text('old')
-        path = backup(self.db, to, keep=14)
+        path = backup(self.s.db, to, keep=14)
         copy = sqlite3.connect(path)
         self.assertEqual(copy.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
         for t in ('notes', 'sections', 'links', 'events', 'decisions', 'status_items'):
@@ -747,6 +745,124 @@ class MemoryTest(unittest.TestCase):
         self.assertEqual(self.s._one("SELECT version FROM notes WHERE path = 'demo/index'")[0], index_version)
         cat = self.s.read('demo/index', heading='Catalog and ownership')
         self.refused('generated_section', self.s.patch_section, 'append', '| [[demo/x]] | hand-added |', cat['version'], section_id=cat['section_id'])
+
+    # ----- searching every domain, the ops domain name, schema versions -----
+
+    def test_search_without_scope_covers_every_domain(self):
+        self.import_extra('other', {'index.md': '# Other\n\n## Catalog\n\n| [[other/page]] | p |\n',
+                                    'page.md': '# Page\n\nThe revert detector, again.\n'})
+        w = self.worker('bot')
+        w.create_note('other/working/bot/mine', 'Mine', body='# Mine\n\nrevert detector scratch\n')
+        paths = {h.get('path') for h in w.search('revert detector')['hits']}
+        self.assertTrue({'demo/topic', 'other/page', 'other/working/bot/mine'} <= paths, paths)
+        self.assertNotIn('other/working/bot/mine', {h.get('path') for h in self.s.search('revert detector')['hits']})
+        self.assertEqual({h['path'] for h in self.s.search('again', mode='exact')['hits']}, {'other/page'})
+
+    def test_ops_domain_is_configurable(self):
+        self.import_extra('feedback', {'index.md': '# Feedback\n\n## Catalog\n\n| [[feedback/log]] | the log |\n',
+                                       'log.md': '# Feedback log\n'})
+        s = Store(self.db, 'test', ops_domain='feedback')
+        self.addCleanup(s.db.close)
+        self.refused('not_found', s.read, 'demo/nowhere')
+        self.assertEqual(s._one("SELECT count(*) FROM events WHERE domain = 'feedback' AND op = 'tool:refused'")[0], 1)
+        self.refused('not_found', self.s.read, 'demo/nowhere')  # the default ops domain, memory-ops, is not in this store
+        self.assertEqual(self.s._one("SELECT count(*) FROM events WHERE op = 'tool:refused'")[0], 1)
+
+    def test_newer_schema_is_refused(self):
+        self.s.db.set_schema_version(99)
+        with self.assertRaisesRegex(RuntimeError, 'schema version 99'):
+            Store(self.db, 'test')
+
+    def test_init_cli(self):
+        url = self.new_url('init')
+        first, again = cli('init', '--url', url), cli('init', '--url', url)
+        self.assertEqual((first.returncode, again.returncode), (0, 0), first.stderr + again.stderr)
+        store_id = re.search(r'store (\S+)', first.stdout).group(1)
+        self.assertIn(store_id, again.stdout)
+        password = urllib.parse.urlsplit(url).password
+        if password:
+            self.assertNotIn(password, first.stdout)
+
+    # ----- moving a store: copy into a new store on this backend -----
+
+    def snapshot(self, s):
+        notes = [r['path'] for r in s._q('SELECT path FROM notes ORDER BY path')]
+        tables = {t: sorted(tuple(map(str, r)) for r in s._q(f'SELECT * FROM {t}'))
+                  for t in ('notes', 'sections', 'links', 'decisions', 'status_items', 'sources', 'note_sources', 'preferences', 'events')}
+        return {'pages': {p: s.render_note(p) for p in notes}, 'tables': tables, 'store_id': s.store_id,
+                'brief': s.brief('demo')['brief'].split('\n', 1)[1]}
+
+    def test_move_a_sqlite_store_with_the_cli(self):
+        src = Store(str(self.dir / 'old.db'), 'test')
+        self.addCleanup(src.db.close)
+        import_domain(src, self.src)
+        src.preference('add', text='Prefer numbers', owner_quote='numbers please')
+        src.status_item('demo', 'add', kind='open', text='Moved item')
+        before = self.snapshot(src)
+        url = self.new_url('moved')
+        out = cli('import', str(self.dir / 'old.db'), '--url', url)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout)['notes'], 7)
+        dst = Store(url, 'test')
+        self.addCleanup(dst.db.close)
+        self.assertEqual(self.snapshot(dst), before)
+        self.assertEqual([h['path'] for h in dst.search('Immutable', scope='demo/sources')['hits']], ['demo/sources/2026-10-01-snapshot'])
+        # new rows get new ids after the copied ones
+        item = dst.status_item('demo', 'add', kind='next', text='After the move')['item_id']
+        self.assertGreater(item, max(r[0] for r in src._q('SELECT id FROM status_items')))
+        self.assertTrue(dst.create_note('demo/after', 'After', 'written after the move', '# After\n', 'a', 'b', '2026-10-30 — t')['ok'])
+        self.assertIn('copy into a new, empty store', cli('import', str(self.dir / 'old.db'), '--url', url).stderr)
+
+    def test_backup_restores_into_a_new_store(self):
+        to = self.dir / 'restore'
+        path = backup(self.s.db, to, keep=1)
+        before = self.snapshot(self.s)
+        url = self.new_url('restored')
+        out = cli('import', f'sqlite://{path}', '--url', url)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        dst = Store(url, 'test')
+        self.addCleanup(dst.db.close)
+        self.assertEqual(self.snapshot(dst), before)
+
+
+@unittest.skipUnless(PG_URL, 'set APEX_MEMORY_TEST_POSTGRES_URL to run the tests on Postgres')
+class PostgresMemoryTest(MemoryTest):
+    def new_url(self, name='test'):
+        import psycopg
+        schema = f'{name}_{uuid.uuid4().hex[:12]}'
+        with psycopg.connect(PG_URL, autocommit=True) as c:
+            c.execute(f'CREATE SCHEMA {schema}')
+        self.addCleanup(self.drop_schema, schema)
+        return PG_URL + ('&' if '?' in PG_URL else '?') + f'options=-csearch_path%3D{schema}'
+
+    def drop_schema(self, schema):
+        import psycopg
+        with psycopg.connect(PG_URL, autocommit=True) as c:
+            c.execute(f'DROP SCHEMA {schema} CASCADE')
+
+    def test_location_hides_the_password(self):
+        self.assertNotIn('password', self.s.location)
+        self.assertIn('search_path', self.s.location)
+
+
+class PortabilityTest(unittest.TestCase):
+    """The store, importer and server reach the database only through the Backend interface."""
+
+    TOKENS = [r'\bfts5\b', r'\bMATCH\b', r'\bbm25\(', r'\bsnippet\(', r'\bPRAGMA\b', r'\bVACUUM\b', r'\bsqlite3?\b', r'\blastrowid\b',
+              r'\browid\b', r'(?<!\.)\bstrftime\(', r'\bjson_tree\b', r'\binstr\(', r'\bregexp\(', r'\bINSERT OR\b', r'\bON CONFLICT\b',
+              r'\bRETURNING\b', r'::', r'\btsvector\b', r'\btsquery\b', r'\bts_rank\b', r'\bILIKE\b', r'\bpsycopg\b', r'\bpg_\w+',
+              r'\bto_char\b', r'\bstrpos\(', r'\bSERIAL\b']
+
+    def test_no_database_specific_sql(self):
+        for name in ('store.py', 'importer.py', 'server.py'):
+            text = (ROOT / 'apex_memory' / name).read_text()
+            found = [tok for tok in self.TOKENS if re.search(tok, text)]
+            self.assertEqual(found, [], f'{name} contains database-specific tokens')
+
+    def test_registry(self):
+        self.assertEqual(type(open_backend(str(pathlib.Path(tempfile.mkdtemp()) / 'x.db'))).__name__, 'SqliteBackend')
+        with self.assertRaisesRegex(ValueError, 'unknown database scheme'):
+            open_backend('mysql://localhost/x')
 
 
 if __name__ == '__main__':

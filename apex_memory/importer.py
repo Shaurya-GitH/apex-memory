@@ -1,4 +1,5 @@
-"""Import one Obsidian domain folder into the store, and the one-time migration check (D07).
+"""Import one folder of markdown notes (an Obsidian-style vault, one folder per domain) into the store, and the
+check that every page renders back identically.
 
 The importer only reads the source files. The index catalog, status page and log become rows
 (notes.summary, status_items, events) and are rendered back from them.
@@ -102,8 +103,9 @@ def import_domain(store, src):
         for r in store._q('SELECT path FROM notes WHERE path LIKE ?', f'{domain}/sources/%'):
             d = DATE.search(r['path'])
             store.db.execute("INSERT INTO sources (id, kind, ref, captured_at) VALUES (?, 'snapshot', ?, ?)", (r['path'], r['path'], d and d.group()))
-        store.db.execute('INSERT OR IGNORE INTO note_sources SELECT DISTINCT s.note, l.dst FROM links l JOIN sections s ON s.id = l.src_section '
-                         'JOIN sources src ON src.id = l.dst WHERE s.note != l.dst')
+        store.db.execute('INSERT INTO note_sources SELECT DISTINCT s.note, l.dst FROM links l JOIN sections s ON s.id = l.src_section '
+                         'JOIN sources src ON src.id = l.dst WHERE s.note != l.dst AND NOT EXISTS '
+                         '(SELECT 1 FROM note_sources x WHERE x.note = s.note AND x.source = l.dst)')
         store._derive_decisions(domain)
         rep['unclassified_decisions'] = [r['id'] for r in store._records(domain) if len(r['status']) != 1]
         for table, sql in [('notes', 'SELECT count(*) FROM notes WHERE domain = ?'),
@@ -128,7 +130,7 @@ def _norm(text):
 
 
 def verify_domain(store, src):
-    """Render every page back from SQLite and compare it with its source file. Returns the mismatches."""
+    """Render every page back from the store and compare it with its source file. Returns the mismatches."""
     src = pathlib.Path(src).expanduser().resolve()
     domain, bad = src.name, []
     for f in sorted(src.rglob('*.md')):

@@ -1,12 +1,12 @@
--- Office AI memory store. Design: KB office-ai/memory/implementation-plan#Schema (D07, D11).
--- Applied once to an empty database; PRAGMA user_version records the schema version.
+-- apex-memory schema, SQLite, migration 1. PRAGMA user_version records how many migrations ran.
+-- The logical tables match ../postgres/001_schema.sql; only types, defaults, triggers and search indexes differ.
 
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);              -- store_id, created_at
 
 CREATE TABLE notes (
   id INTEGER PRIMARY KEY,                    -- explicit so VACUUM INTO keeps the FTS rowids valid
-  path TEXT NOT NULL UNIQUE,                 -- 'office-ai/memory/storage-design'
-  domain TEXT NOT NULL,                      -- 'office-ai'
+  path TEXT NOT NULL UNIQUE,                 -- 'project/docs/storage-design'
+  domain TEXT NOT NULL,                      -- 'project'
   title TEXT, status TEXT, meta JSON,        -- frontmatter; meta keeps the other keys and their order
   summary TEXT,                              -- its index line; NULL = missing from the index
   catalog_position INTEGER,                  -- order of the index catalog rows
@@ -36,7 +36,7 @@ CREATE INDEX links_dst ON links(dst);
 
 CREATE TABLE decisions (                     -- derived from the records' Status lines; never edited directly
   domain TEXT NOT NULL,
-  id TEXT NOT NULL,                          -- 'D07', 'P01'
+  id TEXT NOT NULL,                          -- 'D01', 'P01'
   title TEXT,
   status TEXT NOT NULL CHECK (status IN ('proposed','accepted','superseded','rejected')),
   section INTEGER NOT NULL REFERENCES sections(id) ON DELETE CASCADE,
@@ -120,4 +120,3 @@ CREATE TRIGGER events_ai AFTER INSERT ON events BEGIN
   INSERT INTO events_fts(rowid, op, body) VALUES (new.id, new.op, new.body);
 END;
 
-PRAGMA user_version = 1;
