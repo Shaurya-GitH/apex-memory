@@ -11,9 +11,12 @@ Each write is one transaction. The store does a check of the knowledge in each w
 
 The project started as a part of a private project. This repository is the public extract.
 
+**Low token cost.** In 21 days of real use, the store used less than 1% of all new context tokens. File reads, search and shell output used approximately 15 times more. See [Token cost](#token-cost).
+
 ## Contents
 
 - [Quick start for agents](#quick-start-for-agents)
+- [Token cost](#token-cost)
 - [Data model](#data-model)
 - [Install](#install)
 - [Choose the database](#choose-the-database)
@@ -68,6 +71,31 @@ This procedure installs the store with SQLite, creates one domain and connects C
 9. Start a new Claude Code session. Run `/mcp` and make sure that `apex-memory` shows as connected.
 10. Copy [templates/AGENTS.md](templates/AGENTS.md) into your own `AGENTS.md` or `CLAUDE.md`. Replace its placeholders.
 11. In the new session, call the tool `brief` with `domain` set to your domain.
+
+## Token cost
+
+An agent reads knowledge from the store into its context. Thus the store adds tokens to each session. We measured this cost in real use, not in a benchmark.
+
+The data: all Claude Code sessions of one owner for 21 days. That is 3,515 sessions. 245 of these sessions used the store.
+
+| Measure | Result |
+| --- | --- |
+| Store output, as a part of all new context tokens | **0.77%** |
+| File reads, search and shell output (`Read`, `Grep`, `Bash`), for comparison | 11.9% |
+| Store cost in the sessions that used the store, with cache re-reads | 3.4% (median 1.7%) |
+| Store output in one session that used the store, on average | approximately 29,000 tokens |
+| Part of the store output that came from `read` | 60% |
+| Part of the store output that came from `brief` | 20% |
+
+The store keeps the cost low because an agent reads one section, not a full page. `brief` gives the agent its start context in one call.
+
+How we measured:
+
+- We counted the characters in each tool result. We used 4 characters for each token.
+- For cost, we used these weights: input 1, cache write 1.25, cache read 0.1, output 5.
+- For "with cache re-reads", each later turn reads each store result again from the cache, until the context is compacted.
+
+Your results can be different. They change with the size of your knowledge and with how your agents use it.
 
 ## Data model
 
