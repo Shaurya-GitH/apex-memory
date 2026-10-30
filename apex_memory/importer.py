@@ -29,7 +29,7 @@ def import_domain(store, src):
                                                           if f.is_file() and f.suffix != '.md']}
     with store._write():
         if domain in store._domains():
-            raise Refused('domain_exists', domain=domain, hint='a domain is imported once, into a fresh database')
+            raise Refused('domain_exists', domain=domain, hint='a domain is imported once; to import it again, use a new database or another domain name')
         catalog = []
         for f in sorted(src.rglob('*.md')):
             path = note_path(src, f)

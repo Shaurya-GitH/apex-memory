@@ -3,9 +3,10 @@
 MemoryTest runs on SQLite; PostgresMemoryTest runs the same tests on Postgres when APEX_MEMORY_TEST_POSTGRES_URL
 names a database the tests may create schemas in (each test gets its own schema).
 """
-import asyncio, datetime, json, os, pathlib, re, sqlite3, subprocess, sys, tempfile, textwrap, threading, unittest, urllib.parse, uuid
+import ast, asyncio, datetime, json, os, pathlib, re, sqlite3, subprocess, sys, tempfile, textwrap, threading, unittest, urllib.parse, uuid
+from unittest import mock
 
-from apex_memory.backends import backup, open_backend
+from apex_memory.backends import backup, copy_store, open_backend
 from apex_memory.importer import import_domain, verify_domain
 from apex_memory.store import Refused, Store, TOOLS, local
 
@@ -748,6 +749,46 @@ class MemoryTest(unittest.TestCase):
 
     # ----- searching every domain, the ops domain name, schema versions -----
 
+    def test_regex_inline_flags_keep_multiline_matching(self):
+        hits = self.s.search('(?i)^the revert detector', mode='regex', scope='demo/topic')['hits']
+        self.assertEqual([h['path'] for h in hits], ['demo/topic'])
+        self.assertIn('[The revert detector]', hits[0]['snippet'])
+
+    def test_search_scope_preserves_sqlite_like_semantics(self):
+        for path in ('API/guide', 'Ä/guide', 'api_extra/guide', 'api%/guide', r'api\back/guide'):
+            self.s.create_note('demo/' + path, 'Scope probe', 'scopeprobe', '# Probe\n\nscopeprobe\n', 'a', 'b', '2026-10-30 — t')
+        for mode in ('bm25', 'exact', 'regex'):
+            for scope, expected in [('demo/api', {'demo/API/guide'}), ('demo/ä', set()),
+                                    ('demo/api_', {'demo/api%/guide'}),
+                                    ('demo/api%', {'demo/API/guide', 'demo/api_extra/guide', 'demo/api%/guide', r'demo/api\back/guide'}),
+                                    (r'demo/api\back', {r'demo/api\back/guide'})]:
+                with self.subTest(mode=mode, scope=scope):
+                    paths = {h.get('path') for h in self.s.search('scopeprobe', mode=mode, scope=scope)['hits']}
+                    self.assertEqual(paths, expected)
+
+    def test_keyword_search_normalizes_diacritics_in_all_indexes(self):
+        self.s.create_note('demo/accents', 'Café', 'A café', '# Café\n\nCafé résumé cafe\u0301 æ ộ\n', 'a', 'b', '2026-10-30 — t')
+        event = self.s.log_append('demo', 'VISIT CAFÉ', ['demo/accents'], 'café', 'résumé')
+        for query in ('cafe', 'CAFÉ', 'cafe\u0301'):
+            hits = self.s.search(query, scope='demo', limit=100)['hits']
+            self.assertEqual({h['kind'] for h in hits}, {'note', 'section', 'event'})
+            self.assertIn(event['event_id'], [h.get('event_id') for h in hits])
+        self.assertTrue(self.s.search('resume', scope='demo/accents')['hits'])
+        # unicode61 does not expand ligatures or strip multiple diacritics from a precomposed letter.
+        self.assertEqual(self.s.search('ae', scope='demo/accents')['hits'], [])
+        self.assertEqual(self.s.search('o', scope='demo/accents')['hits'], [])
+
+    def test_copy_store_refuses_itself_before_starting_transactions(self):
+        alias = open_backend(self.db)
+        self.addCleanup(alias.close)
+        before = self.snapshot(self.s)
+        for src in (self.s.db, alias):
+            with self.subTest(same_connection=src is self.s.db):
+                with mock.patch.object(self.s.db, 'transaction', side_effect=AssertionError('transaction started')):
+                    with self.assertRaisesRegex(ValueError, 'itself'):
+                        copy_store(src, self.s.db)
+        self.assertEqual(self.snapshot(self.s), before)
+
     def test_search_without_scope_covers_every_domain(self):
         self.import_extra('other', {'index.md': '# Other\n\n## Catalog\n\n| [[other/page]] | p |\n',
                                     'page.md': '# Page\n\nThe revert detector, again.\n'})
@@ -827,6 +868,45 @@ class MemoryTest(unittest.TestCase):
 
 @unittest.skipUnless(PG_URL, 'set APEX_MEMORY_TEST_POSTGRES_URL to run the tests on Postgres')
 class PostgresMemoryTest(MemoryTest):
+    def test_diacritic_upgrade_reindexes_the_resolved_store_schema(self):
+        from apex_memory.backends.base import SQL
+        url = self.new_url('upgrade')
+        legacy = open_backend(url)
+        self.addCleanup(legacy.close)
+        with legacy.transaction():
+            legacy.run_script((SQL / 'postgres' / '001_schema.sql').read_text())
+            legacy.set_schema_version(1)
+            legacy.execute("INSERT INTO meta VALUES ('store_id', 'legacy')")
+            legacy.insert('notes', {'path': 'demo/cafe', 'domain': 'demo', 'title': 'Café'})
+        schema = legacy.one('SELECT current_schema()')[0]
+        scratch = 'scratch_' + uuid.uuid4().hex[:12]
+        legacy.execute(f'CREATE SCHEMA {scratch}')
+        self.addCleanup(self.drop_schema, scratch)
+        alias = open_backend(url)
+        self.addCleanup(alias.close)
+        alias.execute("SELECT set_config('search_path', ?, false)", (f'{scratch},{schema}',))
+        with alias.transaction():
+            alias.migrate()
+            self.assertEqual(alias.one('SELECT current_schema()')[0], scratch)
+        self.assertEqual([r['path'] for r in legacy.search('notes', 'cafe')], ['demo/cafe'])
+        self.assertEqual(legacy.schema_version(), 2)
+
+    def test_search_path_aliases_share_the_writer_lock(self):
+        import psycopg
+        schema = self.s.db.one('SELECT current_schema()')[0]
+        scratch = 'scratch_' + uuid.uuid4().hex[:12]
+        self.s.db.execute(f'CREATE SCHEMA {scratch}')
+        self.addCleanup(self.drop_schema, scratch)
+        alias = open_backend(self.db)
+        self.addCleanup(alias.close)
+        alias.execute("SELECT set_config('search_path', ?, false)", (f'{scratch},{schema}',))
+        alias.execute("SET lock_timeout = '200ms'")
+        self.assertEqual(alias.one("SELECT value FROM meta WHERE key = 'store_id'")[0], self.s.store_id)
+        with self.s.db.transaction():
+            with self.assertRaises(psycopg.errors.LockNotAvailable):
+                with alias.transaction():
+                    pass
+
     def new_url(self, name='test'):
         import psycopg
         schema = f'{name}_{uuid.uuid4().hex[:12]}'
@@ -853,16 +933,37 @@ class PortabilityTest(unittest.TestCase):
               r'\bRETURNING\b', r'::', r'\btsvector\b', r'\btsquery\b', r'\bts_rank\b', r'\bILIKE\b', r'\bpsycopg\b', r'\bpg_\w+',
               r'\bto_char\b', r'\bstrpos\(', r'\bSERIAL\b']
 
+    @classmethod
+    def dialect_sql(cls, source):
+        literals = []
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                literals.append(node.value)
+            elif isinstance(node, ast.JoinedStr):
+                literals.append(''.join(v.value if isinstance(v, ast.Constant) else '?' for v in node.values))
+        tokens = cls.TOKENS + [r'\bifnull\s*\(', r'\bcollate\s+nocase\b']
+        return [sql for sql in literals if re.match(r'\s*(select|insert|update|delete|create|alter|drop|with|pragma|vacuum)\b', sql, re.I)
+                and any(re.search(tok, sql, re.I) for tok in tokens)]
+
     def test_no_database_specific_sql(self):
         for name in ('store.py', 'importer.py', 'server.py'):
             text = (ROOT / 'apex_memory' / name).read_text()
             found = [tok for tok in self.TOKENS if re.search(tok, text)]
             self.assertEqual(found, [], f'{name} contains database-specific tokens')
+            self.assertEqual(self.dialect_sql(text), [], f'{name} contains database-specific SQL')
 
     def test_registry(self):
         self.assertEqual(type(open_backend(str(pathlib.Path(tempfile.mkdtemp()) / 'x.db'))).__name__, 'SqliteBackend')
         with self.assertRaisesRegex(ValueError, 'unknown database scheme'):
             open_backend('mysql://localhost/x')
+
+    def test_sql_lint_rejects_dialect_constructs(self):
+        for sql in ('insert into notes (title) values (?) returning id', 'SELECT IFNULL(title, ?) FROM notes',
+                    'SELECT title FROM notes ORDER BY title COLLATE NOCASE'):
+            with self.subTest(sql=sql):
+                self.assertTrue(self.dialect_sql('db.execute(' + repr(sql) + ')'))
+        self.assertTrue(self.dialect_sql('db.execute(f"insert into {table} values (?) returning id")'))
+        self.assertFalse(self.dialect_sql('rx.match(value)\ntext = "SQLite file"\ndb.execute("SELECT coalesce(title, ?) FROM notes")'))
 
 
 if __name__ == '__main__':

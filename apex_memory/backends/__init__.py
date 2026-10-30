@@ -26,12 +26,20 @@ def open_backend(url: str) -> Backend:
     if scheme not in BACKENDS:
         raise ValueError(f'unknown database scheme {scheme!r}; known: {", ".join(BACKENDS)}')
     module, cls = BACKENDS[scheme]
-    return getattr(importlib.import_module(module, __name__), cls)(url)
+    try:
+        mod = importlib.import_module(module, __name__)
+    except ModuleNotFoundError as e:
+        raise SystemExit(f'{scheme} needs the {e.name} package: install apex-memory[postgres]') from e
+    return getattr(mod, cls)(url)
 
 
 def copy_store(src: Backend, dst: Backend) -> dict:
     """Copy every row of one store into another whose schema exists and that holds no knowledge yet, ids and store
     identity included. One read transaction on the source, one write transaction on the target. Returns row counts."""
+    src_id = src.one("SELECT value FROM meta WHERE key = 'store_id'")
+    dst_id = dst.one("SELECT value FROM meta WHERE key = 'store_id'")
+    if src is dst or (src_id and dst_id and src_id[0] == dst_id[0]):
+        raise ValueError('cannot copy a store into itself; copy into a new, empty store')
     counts = {}
     with src.transaction(), dst.transaction():
         if dst.one('SELECT 1 FROM notes') or dst.one('SELECT 1 FROM events'):

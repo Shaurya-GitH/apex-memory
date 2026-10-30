@@ -516,7 +516,8 @@ class Store:
         'project/docs'; empty searches every domain. Hits carry path, section id, heading path, version and a snippet."""
         scope = scope.strip('/')
         domain = scope.split('/')[0] or None
-        inscope, args = ('(t.{0} = ? OR t.{0} LIKE ?)', (scope, scope + '/%')) if scope else ('1 = 1', ())
+        inscope, args = (('(t.{0} = ? OR ' + self.db.prefix('t.{0}') + ')', (scope, scope + '/%'))
+                         if scope else ('1 = 1', ()))
         log, log_args = ("t.op NOT LIKE 'tool:%' AND t.domain = ?", (domain,)) if domain else ("t.op NOT LIKE 'tool:%'", ())
         hits = []
         if mode == 'bm25':

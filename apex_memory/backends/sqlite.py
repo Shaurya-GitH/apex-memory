@@ -84,6 +84,9 @@ class SqliteBackend(Backend):
     def regex(self, expr):
         return f'regexp(?, {expr})'
 
+    def prefix(self, expr):
+        return f'{expr} LIKE ?'
+
     def now(self, minutes=0):
         return f"strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '{int(minutes):+d} minutes')"
 

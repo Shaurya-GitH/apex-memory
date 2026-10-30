@@ -48,6 +48,10 @@ class Backend(abc.ABC):
         """A condition that is true when `expr` matches the regular expression given as the next '?' argument."""
 
     @abc.abstractmethod
+    def prefix(self, expr: str) -> str:
+        """Match the next '?' path-prefix LIKE pattern, folding ASCII case only; backslash is literal."""
+
+    @abc.abstractmethod
     def now(self, minutes: int = 0) -> str:
         """SQL for the database's current UTC time plus `minutes`, as text 'YYYY-MM-DDTHH:MM:SS.mmmZ'."""
 

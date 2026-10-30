@@ -1,4 +1,4 @@
-"""Postgres (psycopg 3): tsvector GIN indexes ranked with ts_rank and ts_headline, '~' for regular expressions,
+"""Postgres (psycopg 3): tsvector GIN indexes ranked with ts_rank and ts_headline, regexp_like for regular expressions,
 RETURNING id, and a transaction-level advisory lock per schema for the single-writer guarantee.
 
 URL: postgresql://user:password@host:port/database (postgres:// works too). Every libpq parameter is accepted, e.g.
@@ -12,11 +12,11 @@ from psycopg import conninfo
 from .base import Backend
 
 FTS = {  # table: (indexed document, text for the snippet, ts_rank weights {D, C, B, A}); the documents match sql/postgres
-    'notes': ("setweight(to_tsvector('simple', coalesce(t.title, '')), 'A') || setweight(to_tsvector('simple', coalesce(t.summary, '')), 'B')",
+    'notes': ("setweight(to_tsvector('simple', unicode61_fold(coalesce(t.title, ''))), 'A') || setweight(to_tsvector('simple', unicode61_fold(coalesce(t.summary, ''))), 'B')",
               "coalesce(t.title, '') || ' … ' || coalesce(t.summary, '')", '{0, 0, 0.5, 1}'),
-    'sections': ("setweight(to_tsvector('simple', coalesce(t.heading, '')), 'A') || setweight(to_tsvector('simple', t.body), 'B')",
+    'sections': ("setweight(to_tsvector('simple', unicode61_fold(coalesce(t.heading, ''))), 'A') || setweight(to_tsvector('simple', unicode61_fold(t.body)), 'B')",
                  "coalesce(t.heading, '') || ' … ' || t.body", '{0, 0, 0.33, 1}'),
-    'events': ("setweight(to_tsvector('simple', t.op), 'A') || setweight(to_tsvector('simple', coalesce(t.body, '')), 'B')",
+    'events': ("setweight(to_tsvector('simple', unicode61_fold(t.op)), 'A') || setweight(to_tsvector('simple', unicode61_fold(coalesce(t.body, ''))), 'B')",
                "t.op || ' … ' || coalesce(t.body, '')", '{0, 0, 0.5, 1}'),
 }
 NORMALIZATION = 32  # ts_rank: rank / (rank + 1), saturating like bm25 (closest to it on a real store)
@@ -61,7 +61,10 @@ class PostgresBackend(Backend):
     @contextlib.contextmanager
     def transaction(self):
         with self.db.transaction():
-            self.db.execute('SELECT pg_advisory_xact_lock(hashtext(current_schema()))')  # one writer per store (schema)
+            # Search-path aliases resolving the same store must acquire the same writer lock.
+            self.db.execute("SELECT pg_advisory_xact_lock(hashtext(coalesce("
+                            "(SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                            "WHERE c.oid = to_regclass('meta')), current_schema())))")
             yield
 
     def _run(self, sql, args):
@@ -87,7 +90,7 @@ class PostgresBackend(Backend):
         if not terms:
             return []
         doc, text, weights = FTS[table]
-        word = "phraseto_tsquery('simple', ?)"
+        word = "phraseto_tsquery('simple', unicode61_fold(?))"
         # ts_rank knows no term rarity; weight each word by its BM25 inverse document frequency, as FTS5's bm25 does.
         # ponytail: one count per word and one count(*) per search; keep a statistics table if tables grow very large
         n = self.one(f'SELECT count(*) FROM {table}')[0]
@@ -99,7 +102,11 @@ class PostgresBackend(Backend):
                           (*terms, *terms, *args))
 
     def regex(self, expr):
-        return f"{expr} ~ ('(?n)' || ?)"  # (?n): '^' and '$' match at line breaks, like Python's re.M
+        return f"regexp_like({expr}, ?, 'n')"  # line anchors, without displacing the pattern's inline flags
+
+    def prefix(self, expr):
+        upper, lower = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'
+        return f"translate({expr}, '{upper}', '{lower}') LIKE translate(?, '{upper}', '{lower}') ESCAPE ''"
 
     def now(self, minutes=0):
         return NOW.format(int(minutes))
@@ -112,6 +119,19 @@ class PostgresBackend(Backend):
     def set_schema_version(self, version):
         self.db.execute('CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())')
         self.db.execute('INSERT INTO schema_version (version) VALUES (%s)', (version,))
+
+    def migrate(self):
+        # An alias search path can resolve the store in a later schema. New functions and
+        # indexes in an upgrade belong beside its tables, not in the first empty schema.
+        original = self.one("SELECT current_setting('search_path')")[0]
+        schema = self.one("SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                          "WHERE c.oid = to_regclass('meta')")
+        if schema:
+            self.db.execute("SELECT set_config('search_path', quote_ident(%s), true)", (schema[0],))
+        fresh = super().migrate()
+        if schema:
+            self.db.execute("SELECT set_config('search_path', %s, true)", (original,))
+        return fresh
 
     def run_script(self, sql):
         self.db.execute(sql)
