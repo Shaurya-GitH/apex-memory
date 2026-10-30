@@ -56,7 +56,10 @@ class PostgresBackend(Backend):
     def __init__(self, url):
         info = conninfo.conninfo_to_dict(url)
         self.location = conninfo.make_conninfo(**{k: v for k, v in info.items() if k != 'password'})
-        self.db = psycopg.connect(url, autocommit=True, row_factory=_rows)
+        try:
+            self.db = psycopg.connect(url, autocommit=True, row_factory=_rows)
+        except psycopg.OperationalError as e:
+            raise ConnectionError(f'cannot connect to {self.location}: {str(e).strip()}') from None
 
     @contextlib.contextmanager
     def transaction(self):

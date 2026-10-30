@@ -108,7 +108,7 @@ The store keeps knowledge in domains. A domain is one area of knowledge, for exa
 | Page header | Three fields on a project note: decision status, implementation status and evidence checked. The store also keeps the date `verified_at`. |
 | Index | The page `<domain>/index`. Its catalog table shows one line for each note: the link and the summary. The store makes the catalog from the summaries. |
 | Section | One heading of a note and its text. Each section has an id and a version. You read and edit one section at a time. |
-| Link | `[[<domain>/<note>]]`, `[[<domain>/<note>#Heading]]` or `[[<note>#^block]]` in the text. The store keeps the links in the two directions. `move` rewrites them. |
+| Link | `[[<domain>/<note>]]`, `[[<domain>/<note>#Heading]]` or `[[<note>#^block]]` in the text. The store keeps the links in the two directions. `move` rewrites them in notes. The index catalog and the log are generated from rows, so their links are not stored as links. Log entries keep the old page name after a `move`. |
 | Decision record | A heading such as `D01 — Use SQLite (2026-10-30)` on the page `<domain>/decisions`. It has one `- **Status:**` line. |
 | Decision status | `proposed`, `accepted`, `rejected` or `superseded by Dnn`. Only `set_decision_status` changes the Status line. |
 | Status item | One item on the page `<domain>/status`. The kinds are `state`, `open`, `blocker` and `next`. |
@@ -116,7 +116,7 @@ The store keeps knowledge in domains. A domain is one area of knowledge, for exa
 | Tool event | An automatic log record of each write and each search. The log page does not show tool events. `log_query` shows them on request. |
 | Source | A record of where knowledge came from: `snapshot`, `live`, `transcript`, `web` or `owner`. A note can cite a source. |
 | Preference | A rule from the owner about how to do work, with the words of the owner. Each brief shows the active preferences. |
-| Lease | A claim on a section for 1 to 60 minutes. Other agents cannot write to that section while the lease is active. |
+| Lease | A claim on a section for 1 to 60 minutes. A longer time becomes 60 minutes. Other agents cannot write to that section while the lease is active. |
 | Working note | A scratch note under `<domain>/working/<actor>/`. It needs no summary and no page header. It is not in the index. |
 | Ops domain | The domain that gets an automatic record of each refusal and each error. The default name is `memory-ops`. |
 
@@ -203,10 +203,18 @@ The output is `store <store id> at <path>`. Run `init` again to see the store id
    docker run -d --name apex-memory-pg -e POSTGRES_PASSWORD=test -p 5432:5432 postgres:17
    ```
 
-3. Create a user. The password of the `postgres` user is `test`.
+   If a Postgres server already uses port 5432 on your computer, use a different host port, for example `-p 55432:5432`. Then use that port in the URLs below.
+
+3. Create a user. The password of the `postgres` user is `test`. `psql` asks for it.
 
    ```sh
    psql -h localhost -U postgres -c "CREATE ROLE apex LOGIN PASSWORD 'secret'"
+   ```
+
+   If `psql` is not installed, run it in the Docker container. Use this form for each `psql` command in this section:
+
+   ```sh
+   docker exec -e PGPASSWORD=test apex-memory-pg psql -U postgres -c "CREATE ROLE apex LOGIN PASSWORD 'secret'"
    ```
 
 4. Create a database that the user owns. The user must be able to create tables in it.
@@ -419,7 +427,7 @@ The headings in `content` are relative to the section. A direct subsection start
 
 To add a subsection, use `op: "append"`. `prepend` adds text before the own text of the section. It cannot add headings.
 
-`heading` can be the heading text or a list with the full heading path. If two sections have the same heading, the store gives the candidates. Then use `section_id`.
+`heading` can be the heading text or a list with the full heading path. The path starts at the highest heading in the note text. An imported note usually has an H1, so its path starts with the H1, for example `["myproject status", "Blockers"]`. A note from `create_note` has its title outside the text, so its path starts with its first heading, for example `["Design", "Details"]`. If two sections have the same heading, the store gives the candidates. Then use `section_id`.
 
 The index catalog, the status items and the log entries are generated sections. `patch_section` refuses them. Use the `summary` field, `status_item` and `log_append`.
 
@@ -450,6 +458,12 @@ A refusal is an expected result. It is not an error of the server. The `error` f
 | `status_line_changed`, `decision_overwritten`, `decision_removed` | The edit changes a decision record in a way that is not permitted. | Use `set_decision_status`, or append text only. |
 | `unknown_pages` | `log_append` names a page that is not in the store. | Name pages that exist. |
 | `bad_regex` | The pattern does not compile in Python. | Correct the pattern. |
+| `headings_not_allowed` | `prepend` text contains a heading. | Use `append` to add subsections. |
+| `bad_transition` | `set_decision_status` asks for a change that the life cycle does not permit, for example accepted to proposed. | Use proposed to accepted, rejected or superseded, or accepted to superseded. |
+| `quote_required` | `preference` `add` has no words of the owner. | Give the quote of the owner. |
+| `promotion_needs_summary_and_header` | `move` of a working note into project knowledge has no summary or page header. | Give `summary` and the header fields. |
+| `bad_path` | The path is not permitted, for example a `move` of the index. | Use a path of a normal note. |
+| `domain_exists` | `apex-memory import` of a domain that is in the store. | Use a new database or another domain name. |
 
 If the ops domain exists, the store records each refusal and each error in it. The record keeps the tool, the arguments and the result. The store replaces the `content` argument and long text with their length.
 
@@ -521,7 +535,7 @@ apex-memory verify ~/apex-notes/myproject
 
 4. Set `APEX_MEMORY_URL` to the Postgres URL in your shell profile and in each MCP client.
 
-The copy keeps all rows, ids, the store id and the dates. It reads the source in one transaction and writes the target in one transaction. The target must not have notes or log entries. If it has, the copy stops with `already holds knowledge`.
+The copy keeps all rows, ids, the store id and the dates. It reads the source in one transaction and writes the target in one transaction. The target must not have notes or log entries. If it has, the copy stops with `already holds knowledge`. A copy of a store into the same store stops with `cannot copy a store into itself`.
 
 The same command moves a store from Postgres to SQLite, or from SQLite to SQLite. The source can be a backup file or a URL.
 
@@ -583,6 +597,8 @@ SQLite and Postgres give the same pages, checks, briefs, links and log queries. 
 | `exact` search | A trigram index for queries of 3 characters or more. | A scan of all section rows. |
 | Single writer | `BEGIN IMMEDIATE` and WAL. | An advisory lock for each schema. |
 | Backup | `VACUUM INTO`. | A logical copy into a SQLite file. |
+| Search snippets | The match is in brackets, for example `The [café] on`. | Context around the match, with no brackets. |
+| `section_id` values | A refused write uses no id. | A refused write can use an id. Thus ids can be different from the ids of the same history on SQLite. Do not compare ids between backends. |
 
 ### Regular expressions on Postgres
 

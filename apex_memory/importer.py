@@ -124,7 +124,7 @@ def import_domain(store, src):
 def _norm(text):
     out = []
     for line in (l.rstrip() for l in text.splitlines()):
-        if line or (out and out[-1]):
+        if line or (out and out[-1] and out[-1] != '---'):  # the store adds a blank line after front matter
             out.append(line)
     return '\n'.join(out).strip('\n')
 

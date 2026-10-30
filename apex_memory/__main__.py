@@ -43,7 +43,10 @@ def main():
             sys.exit('--fresh only deletes SQLite databases whose file name contains "test"')
         for suffix in ('', '-wal', '-shm'):
             pathlib.Path(path + suffix).expanduser().unlink(missing_ok=True)
-    store = Store(a.url, a.actor, a.role or 'owner', a.run_id, a.ops_domain)
+    try:
+        store = Store(a.url, a.actor, a.role or 'owner', a.run_id, a.ops_domain)
+    except ConnectionError as e:
+        sys.exit(str(e))
     try:
         if a.command == 'init':
             print(f'store {store.store_id} at {store.location}')
@@ -74,6 +77,8 @@ def main():
             sys.exit(1 if probs else 0)
     except Refused as e:
         sys.exit(json.dumps(e.info, ensure_ascii=False))
+    except ValueError as e:  # e.g. unsupported front matter in an imported note
+        sys.exit(f'{a.command}: {e}')
     finally:
         store.db.close()
 
