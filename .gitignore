@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+dist/
+*.egg-info/
+*.db
+*.db-wal
+*.db-shm
+.extraction-report.md

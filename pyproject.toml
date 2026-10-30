@@ -1,0 +1,25 @@
+[project]
+name = "apex-memory"
+version = "0.1.0"
+description = "A knowledge store for AI agents, served over MCP: notes, sections, links, decisions, status and an append-only log."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Shaurya" }]
+requires-python = ">=3.12"
+dependencies = ["mcp>=2.3"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Database",
+]
+
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3"]
+
+[project.scripts]
+apex-memory = "apex_memory.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
