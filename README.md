@@ -600,8 +600,6 @@ The store compiles each `regex` pattern in Python first. Then it sends the patte
 
 6. Remove the server: `docker rm -f apex-memory-test-pg`.
 
-The CI workflow `.github/workflows/tests.yml` runs all the tests on Python 3.12 and 3.14 with a `postgres:17` service.
-
 ## Add a database backend
 
 The store reaches the database only through the `Backend` interface in `apex_memory/backends/base.py`. Each backend is one module.
