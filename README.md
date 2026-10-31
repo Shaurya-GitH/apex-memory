@@ -656,7 +656,7 @@ When you install a tag, `uv tool upgrade` does not change the version. To follow
 The first time that the new version opens a store with an older schema, it does these steps:
 
 1. It gets the writer lock of the store. If two servers start at the same time, only one of them does the next steps. The other server waits, then uses the new schema.
-2. It writes a backup of the store to `pre-migration-YYYYMMDD-HHMMSS-v<old>-to-v<new>.db`, and does an integrity check of the backup.
+2. It writes a backup of the store to `pre-migration-YYYYMMDD-HHMMSS-<unique>-v<old>-to-v<new>.db`, and does an integrity check of the backup. It syncs the file and its directory before migration. The unique suffix prevents different stores from overwriting each other's safety backups.
    - SQLite: the backup goes into the folder `backups` next to the store file.
    - Postgres: the backup is a SQLite file in `~/.apex-memory/backups`.
    - If `APEX_MEMORY_BACKUP_DIR` is set, the backup goes into that folder for both backends.
@@ -693,7 +693,7 @@ The command does not change the store. It shows:
 2. Import the pre-migration backup into a new, empty store:
 
    ```sh
-   apex-memory import ~/.apex-memory/backups/pre-migration-20261031-120000-v1-to-v2.db --url sqlite:///Users/you/.apex-memory/rolled-back.db
+   apex-memory import ~/.apex-memory/backups/pre-migration-20261031-120000-7c29e0fc51324efebfe947858d65b7ac-v1-to-v2.db --url sqlite:///Users/you/.apex-memory/rolled-back.db
    ```
 
 3. Set `APEX_MEMORY_URL` to the new store in each MCP client. Restart the clients.

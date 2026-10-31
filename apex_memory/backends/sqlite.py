@@ -35,13 +35,16 @@ def check_integrity(path):
 class SqliteBackend(Backend):
     name = 'sqlite'
 
-    def __init__(self, url):
+    def __init__(self, url, *, readonly=False):
         path = str(url).removeprefix('sqlite://')
         self.location = os.path.abspath(os.path.expanduser(path))
-        pathlib.Path(self.location).parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.location, isolation_level=None, check_same_thread=False)
+        if not readonly:
+            pathlib.Path(self.location).parent.mkdir(parents=True, exist_ok=True)
+        target = pathlib.Path(self.location).as_uri() + '?mode=ro' if readonly else self.location
+        self.db = sqlite3.connect(target, uri=readonly, isolation_level=None, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
-        self.db.execute('PRAGMA journal_mode=WAL')
+        if not readonly:
+            self.db.execute('PRAGMA journal_mode=WAL')
         self.db.execute('PRAGMA busy_timeout=5000')
         self.db.execute('PRAGMA foreign_keys=ON')
         self.db.create_function('regexp', 2, _regexp, deterministic=True)

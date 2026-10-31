@@ -99,7 +99,7 @@ def status(url, to):
         print(f'no store at {pathlib.Path(path).expanduser().resolve()}: apex-memory init creates it')
         sys.exit(1)
     try:
-        db = open_backend(url)
+        db = open_backend(url, readonly=True)
     except ConnectionError as e:
         sys.exit(str(e))
     try:

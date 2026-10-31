@@ -184,7 +184,7 @@ class Store:
         """A verified backup before pending migrations run; on failure nothing is migrated."""
         to = safety_backup_dir(self.db)
         try:
-            return str(backup(self.db, to, name=f'pre-migration-{datetime.datetime.now():%Y%m%d-%H%M%S}-v{version}-to-v{known}.db'))
+            return str(backup(self.db, to, name=f'pre-migration-{datetime.datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex}-v{version}-to-v{known}.db'))
         except Exception as e:
             raise RuntimeError(f'{self.location} needs migration from schema {version} to {known}, but the safety backup to {to} failed '
                                f'({type(e).__name__}: {e}); the store is not migrated. Free disk space or set APEX_MEMORY_BACKUP_DIR '

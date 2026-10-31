@@ -17,7 +17,7 @@ import argparse, asyncio, contextlib, datetime, importlib.metadata, json, os, pa
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
-from apex_memory.backends import open_backend  # noqa: E402
+from apex_memory.backends import TABLES, open_backend  # noqa: E402
 from apex_memory.backends.base import SQL  # noqa: E402
 from apex_memory.store import Store, TOOLS  # noqa: E402
 
@@ -120,9 +120,10 @@ def launch(a):
           'version': importlib.metadata.version('apex-memory'), 'commit': _git('rev-parse', '--short', 'HEAD'), 'container': None, 'port': None}
     if a.backend == 'postgres':
         st['container'], st['port'] = f'apex-memory-verify-{name}', free_port()
-        subprocess.run(['docker', 'run', '-d', '--rm', '--name', st['container'], '--label', f'apex-memory-verify={name}',
-                        '-e', f'POSTGRES_PASSWORD={PG_PASSWORD}', '-p', f"127.0.0.1:{st['port']}:5432", 'postgres:17'],
-                       check=True, capture_output=True)
+        out = subprocess.run(['docker', 'run', '-d', '--rm', '--name', st['container'], '--label', f'apex-memory-verify={name}',
+                              '-e', f'POSTGRES_PASSWORD={PG_PASSWORD}', '-p', f"127.0.0.1:{st['port']}:5432", 'postgres:17'],
+                             check=True, capture_output=True, text=True)
+        st['container_id'] = out.stdout.strip()
         (d / 'state.json').write_text(json.dumps(st, indent=2))  # cleanup can find the container from here on
         _wait_pg(st)
         with pg_admin(st) as c:
@@ -242,8 +243,8 @@ def doctor(a):
 def cleanup(a):
     d = run_dir(a.run)
     st = state(d)
-    if st.get('container'):
-        subprocess.run(['docker', 'rm', '-f', st['container']], capture_output=True)  # only the container this run started
+    if st.get('container_id'):
+        subprocess.run(['docker', 'rm', '-f', st['container_id']], capture_output=True)  # names can be reused
     for sub in ('home', 'db', 'work'):
         shutil.rmtree(d / sub, ignore_errors=True)
     st['cleaned'] = datetime.datetime.now().isoformat(timespec='seconds')
@@ -745,6 +746,10 @@ async def store_admin(j, o, w):
     j.log({'compare': same, 'store_ids': sid})
     j.check('rows: same counts in every table', all(x == y for x, y in same.values()), same)
     j.check('store identity moves with it', sid[0] == sid[1], sid)
+    for table in TABLES:
+        a, b = (j.rows(f'SELECT * FROM {table}', url=url) for url in (j.url, new))
+        j.check(f'rows: same contents in {table}',
+                sorted(json.dumps(r, sort_keys=True) for r in a) == sorted(json.dumps(r, sort_keys=True) for r in b))
     p = j.cli('import', path, url=new)
     j.check('a second copy into the moved store is refused', p.returncode != 0 and 'copy into a new, empty store' in p.stderr, p.stderr)
     other = empty_store(j.st, j.name.replace('-', '_') + '_other')

@@ -20,8 +20,8 @@ def default_url() -> str:
     return os.environ.get('APEX_MEMORY_URL') or 'sqlite://' + str(pathlib.Path('~/.apex-memory/memory.db').expanduser())
 
 
-def open_backend(url: str) -> Backend:
-    """A connected backend for a URL; a bare path is a SQLite file."""
+def open_backend(url: str, *, readonly: bool = False) -> Backend:
+    """A connected backend for a URL; a bare path is a SQLite file. readonly prevents SQLite creation and persistent writes."""
     scheme = str(url).split('://', 1)[0] if '://' in str(url) else 'sqlite'
     if scheme not in BACKENDS:
         raise ValueError(f'unknown database scheme {scheme!r}; known: {", ".join(BACKENDS)}')
@@ -30,7 +30,7 @@ def open_backend(url: str) -> Backend:
         mod = importlib.import_module(module, __name__)
     except ModuleNotFoundError as e:
         raise SystemExit(f'{scheme} needs the {e.name} package: install apex-memory[postgres]') from e
-    return getattr(mod, cls)(url)
+    return getattr(mod, cls)(url, readonly=readonly) if scheme == 'sqlite' else getattr(mod, cls)(url)
 
 
 def copy_store(src: Backend, dst: Backend) -> dict:
@@ -80,10 +80,17 @@ def backup(db: Backend, to_dir, keep: int = 14, name: str | None = None) -> path
     tmp.unlink(missing_ok=True)
     try:
         db.backup(tmp)
+        with tmp.open('rb') as saved:
+            os.fsync(saved.fileno())
+        os.replace(tmp, final)
+        directory = os.open(to, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
-    os.replace(tmp, final)
     for old in ([] if name else sorted(to.glob('memory-*.db'))[:-keep]):
         old.unlink()
     return final

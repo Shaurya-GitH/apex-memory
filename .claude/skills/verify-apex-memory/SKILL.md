@@ -66,7 +66,7 @@ Each drive writes `.verify/<run>/evidence/<feature>-<n>/`:
 uv run --extra postgres scripts/verify cleanup                  # or --run <name>
 ```
 
-Removes only what the run started: its container (`docker rm -f apex-memory-verify-<run>`, by exact name from `state.json`), and `home/`, `db/` and `work/`. It keeps `.verify/<run>/evidence/` and `state.json` and prints `CLEANED run=<name>; evidence kept at <dir>`. Never kill processes or containers by pattern. Run cleanup after failed attempts too.
+Removes only what the run started: its container (`docker rm -f <container_id>`, using the ID saved in `state.json`), and `home/`, `db/` and `work/`. Older runs without a saved container ID leave the container alone. It keeps `.verify/<run>/evidence/` and `state.json` and prints `CLEANED run=<name>; evidence kept at <dir>`. Never kill processes or containers by pattern. Run cleanup after failed attempts too.
 
 ## Helpers
 

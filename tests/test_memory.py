@@ -1222,7 +1222,7 @@ class MemoryTest(unittest.TestCase):
         self.addCleanup(s.db.close)
         self.assertEqual(s.db.schema_version(), n)
         [bk] = self.backups()
-        self.assertRegex(bk.name, rf'^pre-migration-\d{{8}}-\d{{6}}-v{n - 1}-to-v{n}\.db$')
+        self.assertRegex(bk.name, rf'^pre-migration-\d{{8}}-\d{{6}}-[0-9a-f]{{32}}-v{n - 1}-to-v{n}\.db$')
         ev = s._q("SELECT op, refs FROM events WHERE domain = 'memory-ops' AND op LIKE 'MIGRATION%'")
         self.assertEqual(len(ev), 1)
         self.assertEqual(json.loads(ev[0]['refs']), {'from': n - 1, 'to': n, 'backup': str(bk)})
@@ -1247,6 +1247,40 @@ class MemoryTest(unittest.TestCase):
         db = open_backend(url)
         self.addCleanup(db.close)
         self.assertEqual(db.schema_version(), n - 1)
+
+    def test_safety_backups_from_different_stores_do_not_collide(self):
+        other = Store(self.new_url('other'), 'test')
+        self.addCleanup(other.db.close)
+        n = len(self.s.db.migrations())
+        with mock.patch('apex_memory.store.datetime', wraps=datetime) as clock:
+            clock.datetime.now.return_value = datetime.datetime(2026, 10, 31, 12)
+            first = pathlib.Path(self.s._safety_backup(n - 1, n))
+            contents = first.read_bytes()
+            second = pathlib.Path(other._safety_backup(n - 1, n))
+        self.assertNotEqual(first, second)
+        self.assertEqual(first.read_bytes(), contents)
+        for path, sid in ((first, self.s.store_id), (second, other.store_id)):
+            with sqlite3.connect(path) as db:
+                self.assertEqual(db.execute("SELECT value FROM meta WHERE key = 'store_id'").fetchone()[0], sid)
+
+    def test_backup_sync_failure_prevents_migration(self):
+        url, n, _ = self.older_store()
+        for fail_at in (1, 2):  # backup file, then its published directory entry
+            with self.subTest(fail_at=fail_at):
+                calls = []
+                def sync(fd):
+                    calls.append(fd)
+                    if len(calls) == fail_at:
+                        raise OSError('injected backup sync failure')
+                with mock.patch('apex_memory.backends.os.fsync', side_effect=sync):
+                    with self.assertRaisesRegex(RuntimeError, r'safety backup .* failed.*not migrated'):
+                        Store(url, 'test')
+                db = open_backend(url)
+                try:
+                    self.assertEqual(db.schema_version(), n - 1)
+                    self.assertEqual(db.one("SELECT count(*) FROM events WHERE op LIKE 'MIGRATION%'")[0], 0)
+                finally:
+                    db.close()
 
     def test_two_processes_migrate_once(self):
         url, n, _ = self.older_store()
@@ -1292,6 +1326,25 @@ class MemoryTest(unittest.TestCase):
             self.assertEqual(out.returncode, 1)
             self.assertIn('no store', out.stdout + out.stderr)
             self.assertFalse(missing.exists())
+
+    def test_status_does_not_change_delete_mode_sqlite(self):
+        if self.s.db.name != 'sqlite':
+            self.skipTest('SQLite journal mode')
+        url, n, _ = self.older_store()
+        path = pathlib.Path(url)
+        with sqlite3.connect(path) as db:
+            self.assertEqual(db.execute('PRAGMA journal_mode=DELETE').fetchone()[0], 'delete')
+        before = path.read_bytes()
+        path.chmod(0o444)
+        try:
+            out = cli('status', '--url', 'sqlite://' + str(path))
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn(f'schema version {n - 1}', out.stdout)
+            self.assertEqual(path.read_bytes(), before)
+            self.assertFalse(path.with_name(path.name + '-wal').exists())
+            self.assertFalse(path.with_name(path.name + '-shm').exists())
+        finally:
+            path.chmod(0o644)
 
     def test_init_cli(self):
         url = self.new_url('init')
