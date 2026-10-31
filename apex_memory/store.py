@@ -211,7 +211,7 @@ class Store:
             return {'ok': True, **result}
 
     def _check_state(self, domains):
-        return {key: (text, n, shown) for d in domains for key, text, n, shown in self._problems(d)}
+        return {(d, key): (text, n, shown) for d in domains for key, text, n, shown in self._problems(d)}
 
     def _refuse_new(self, before, domains):
         new = sorted(text for key, (text, n, shown) in self._check_state(domains).items()
@@ -227,8 +227,15 @@ class Store:
         try:
             if not self._one('SELECT 1 FROM notes WHERE domain = ? LIMIT 1', self.ops_domain):
                 return
-            args = {k: (f'<{len(v)} chars>' if k == 'content' or (isinstance(v, str) and len(v) > 200) else v)
-                    for k, v in bound.items() if k != 'self' and v is not None}
+            def redact(value, key=None):
+                if isinstance(value, str) and (key in ('content', 'body') or len(value) > 200):
+                    return f'<{len(value)} chars>'
+                if isinstance(value, dict):
+                    return {k: redact(v, k) for k, v in value.items()}
+                if isinstance(value, (list, tuple)):
+                    return [redact(v) for v in value]
+                return value
+            args = {k: redact(v, k) for k, v in bound.items() if k != 'self' and v is not None}
             result = {k: v for k, v in info.items() if k != 'content'}
             body = json.dumps({'tool': tool, 'args': args, 'result': result}, ensure_ascii=False, default=str)[:4000]
             with self._write():
@@ -578,7 +585,6 @@ class Store:
             for r in self.db.search('events', query, log, log_args):
                 hits.append({'kind': 'event', 'event_id': r['id'], 'ts': local(r['ts']), 'op': r['op'], 'snippet': r['snippet'], 'score': r['score']})
                 texts.append(f"{r['op']} {r['body'] or ''}")
-            hits = _coordinate(query, hits, texts)
         elif mode in ('exact', 'regex'):
             if mode == 'regex':
                 try:
@@ -598,8 +604,10 @@ class Store:
         else:
             raise Refused('bad_mode', mode=mode, modes=['bm25', 'exact', 'regex'])
         in_working = scope.split('/')[1:2] == ['working']
-        hits = [h for h in hits if in_working or 'path' not in h or not self._is_working(h['path'])
-                or h['path'].startswith(f"{h['path'].split('/')[0]}/working/{self.actor}/")][:limit]
+        visible = [i for i, h in enumerate(hits) if in_working or 'path' not in h or not self._is_working(h['path'])
+                   or h['path'].startswith(f"{h['path'].split('/')[0]}/working/{self.actor}/")]
+        hits = (_coordinate(query, [hits[i] for i in visible], [texts[i] for i in visible]) if mode == 'bm25'
+                else [hits[i] for i in visible])[:limit]
         with self._write():
             self._event(domain, 'tool:search', [h.get('section_id') or h.get('path') or h.get('event_id') for h in hits],
                         json.dumps({'query': query, 'mode': mode, 'scope': scope, 'hits': len(hits)}, ensure_ascii=False))
@@ -679,9 +687,9 @@ class Store:
                 if op == 'prepend':
                     new = '\n' + content.strip('\n') + '\n\n' + current.lstrip('\n')
                 else:
-                    new = ('\n' + content.strip('\n') + '\n\n' if content.strip() else '\n') + current[len(t['body']):]
+                    new = '\n' + content.strip('\n') + '\n\n' if content.strip() else '\n'
             records = {r['id']: r for r in self._records(domain)} if t['note'] == f'{domain}/decisions' else None
-            changed, diff = self._apply_subtree(t, rows, new)
+            changed, diff = self._apply_subtree(t, rows[:1] if op == 'replace_own_text' else rows, new)
             if summary is not None:
                 pos = None if self._is_working(t['note']) else self._one(
                     'SELECT coalesce(max(catalog_position), 0) + 1 FROM notes WHERE domain = ?', domain)[0]
@@ -898,6 +906,7 @@ class Store:
             self._check_leases([r['id'] for r in self._subtree(s) + self._ancestors(s)])
             body = STATUS_LINE.sub(lambda m: f'- **Status:** {new}', s['body'], count=1)
             self.db.execute('UPDATE sections SET body = ?, version = version + 1 WHERE id = ?', (body, s['id']))
+            self._relink([s['id']])
             for a in self._ancestors(s):
                 self.db.execute('UPDATE sections SET version = version + 1 WHERE id = ?', (a['id'],))
             self._touch(s['note'])

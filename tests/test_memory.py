@@ -377,6 +377,30 @@ class MemoryTest(unittest.TestCase):
         idx = self.s.read('demo/index', heading='Demo knowledge index')  # its subtree holds the generated catalog
         self.assertTrue(self.s.patch_section('replace_own_text', 'The demo domain.', idx['version'], section_id=idx['section_id'])['ok'])
 
+    def test_replace_own_text_preserves_generated_rows_and_later_updates(self):
+        for path, heading in (('demo/index', 'Demo knowledge index'), ('demo/status', 'Demo — status')):
+            r = self.s.read(path, heading=heading)
+            descendants = [dict(s) for s in self.s._sections(path) if s['level'] and s['level'] > 1]
+            self.s.patch_section('replace_own_text', 'New introduction.', r['version'], section_id=r['section_id'])
+            self.assertEqual([dict(s) for s in self.s._sections(path) if s['level'] and s['level'] > 1], descendants)
+        rules = self.s.read('demo/topic', heading='Rules')
+        self.s.patch_section('append', 'More rules.', section_id=rules['section_id'], summary='Updated topic summary')
+        index = self.s.render_note('demo/index')
+        self.assertEqual(index.count('| [[demo/topic]] |'), 1)
+        self.assertIn('| [[demo/topic]] | Updated topic summary |', index)
+        self.assertNotIn('**Owner:** the topic', index)
+        item = self.s.status_item('demo', 'add', kind='open', text='Temporary item')['item_id']
+        self.s.status_item('demo', 'close', item_id=item)
+        self.assertNotIn('Temporary item', self.s.render_note('demo/status'))
+        self.assertEqual(self.s.render_note('demo/status').count('- Write the tests.'), 1)
+
+    def test_replace_own_text_with_open_fence_keeps_subsections(self):
+        r = self.s.read('demo/topic', heading='Topic')
+        descendants = [dict(s) for s in self.s._subtree(self.s._target(section_id=r['section_id']))[1:]]
+        self.s.patch_section('replace_own_text', 'Example:\n```text\nunclosed', r['version'], section_id=r['section_id'])
+        self.assertEqual([dict(s) for s in self.s._subtree(self.s._target(section_id=r['section_id']))[1:]], descendants)
+        self.assertIn('Detailed rules live here.', self.s.read('demo/topic', heading='Details')['content'])
+
     def test_create_domain_and_list_domains(self):
         # Real cases: no tool created a domain (event 511); an agent could not find a domain (event 296, brief('__list__')).
         w = self.worker()
@@ -438,6 +462,15 @@ class MemoryTest(unittest.TestCase):
         self.refused('bad_transition', self.s.set_decision_status, 'demo', 'D02', 'accepted')
         self.refused('superseded_by_required', self.s.set_decision_status, 'demo', 'D01', 'superseded', superseded_by='D02')
         self.assertIn('void', json.loads(self.s._one("SELECT body FROM events WHERE op = 'tool:set_decision_status'")[0])['to'])
+
+    def test_void_reason_links_are_checked_and_indexed(self):
+        before = self.snapshot(self.s)
+        info = self.refused('check_failed', self.s.set_decision_status, 'demo', 'D02', 'void', reason='See [[demo/missing]].')
+        self.assertIn('broken link [[demo/missing]]', info['problems'][0])
+        self.assertEqual(self.snapshot(self.s), before)
+        self.s.set_decision_status('demo', 'D02', 'void', reason='See [[demo/topic#Details]].')
+        links = self.s.links('demo/topic', 'in')['links']
+        self.assertTrue(any(l['from'] == 'demo/decisions' and l['anchor'] == '#Details' and not l['broken'] for l in links))
 
     def test_status_item_update(self):
         # Real case (memory-ops event 796): an open item's text could not be changed.
@@ -530,6 +563,15 @@ class MemoryTest(unittest.TestCase):
         self.assertEqual(self.refused('not_allowed', self.worker().batch, [good])['op_index'], 0)  # role rules per op
         self.assertEqual(self.snapshot(self.s), before)
 
+    def test_batch_cannot_reuse_another_domains_decision_problem(self):
+        self.import_extra('aaa', {'index.md': '# A\n', 'decisions.md': '# Decisions\n\n## D03 — Legacy\n\nNo status line.\n'})
+        args = {'op': 'append', 'content': '# D03 — New\n\nNo status line.', 'path': 'demo/decisions', 'heading': 'Accepted'}
+        self.refused('check_failed', self.s.patch_section, **args)
+        before = self.snapshot(self.s)
+        info = self.refused('check_failed', self.s.batch, [{'tool': 'patch_section', 'args': args}])
+        self.assertEqual(info['problems'], ["decision D03 needs exactly one '- **Status:**' line (has 0)"])
+        self.assertEqual(self.snapshot(self.s), before)
+
     # ----- search -----
 
     def test_search_modes(self):
@@ -559,6 +601,14 @@ class MemoryTest(unittest.TestCase):
         self.assertEqual(hits[0]['path'], 'demo/strong')
         self.assertNotIn('demo/weak', [h.get('path') for h in hits])  # below the floor: 1 of 3 terms
         self.assertIn('demo/weak', [h.get('path') for h in self.s.search('cache zebra', scope='demo')['hits']])  # none passes: all stay
+
+    def test_hidden_working_notes_do_not_set_the_search_floor(self):
+        self.s.create_note('demo/answer', 'Answer', 'public answer', '# Answer\n\nCache rules.\n', 'a', 'b', '2026-10-31 — test')
+        other = self.worker('other')
+        other.create_note('demo/working/other/scratch', 'Scratch', body='# Scratch\n\nCache invalidation.\n')
+        self.assertEqual([h['path'] for h in self.s.search('cache invalidation', scope='demo')['hits']], ['demo/answer'])
+        self.assertEqual([h['path'] for h in other.search('cache invalidation', scope='demo')['hits']], ['demo/working/other/scratch'])
+        self.assertEqual([h['path'] for h in self.s.search('cache invalidation', scope='demo/working')['hits']], ['demo/working/other/scratch'])
 
     def test_exact_matches_whole_words_and_snippets_end_on_words(self):
         # Real case: exact 'D51' matched inside commit hashes.
@@ -941,6 +991,21 @@ class MemoryTest(unittest.TestCase):
         self.assertEqual(json.loads(self.s._one("SELECT body FROM events WHERE op = 'tool:error'")[0])['result']['error'], 'ZeroDivisionError')
         self.s.log_append('memory-ops', 'FAILURE: search missed a page', ['memory-ops/log'], 'looking for X', 'found it by reading the index')
         self.assertEqual([e['op'] for e in self.s.log_query('memory-ops', op='FAILURE')['entries']], ['FAILURE: search missed a page'])
+
+    def test_batch_refusal_redacts_nested_content_and_body(self):
+        self.s.create_domain('memory-ops', 'Memory ops', 'Test refusals')
+        r = self.s.read('demo/topic', heading='Rules')
+        ops = [{'tool': 'create_note', 'args': {'path': 'demo/working/test/new', 'title': 'New', 'body': 'private body marker'}},
+               {'tool': 'patch_section', 'args': {'op': 'replace', 'content': 'private content marker',
+                                                'if_version': r['version'] + 1, 'section_id': r['section_id']}}]
+        self.refused('version_conflict', self.s.batch, ops)
+        event = self.s._one("SELECT body FROM events WHERE domain = 'memory-ops' AND op = 'tool:refused'")[0]
+        self.assertNotIn('private body marker', event)
+        self.assertNotIn('private content marker', event)
+        args = json.loads(event)['args']['ops']
+        self.assertEqual(args[0]['args']['body'], '<19 chars>')
+        self.assertEqual(args[1]['args']['content'], '<22 chars>')
+        self.assertFalse(self.s._one("SELECT 1 FROM notes WHERE path = 'demo/working/test/new'"))
 
     # ----- MCP server -----
 
