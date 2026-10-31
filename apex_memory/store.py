@@ -681,7 +681,7 @@ class Store:
                 else:
                     new = ('\n' + content.strip('\n') + '\n\n' if content.strip() else '\n') + current[len(t['body']):]
             records = {r['id']: r for r in self._records(domain)} if t['note'] == f'{domain}/decisions' else None
-            changed = self._apply_subtree(t, rows, new)
+            changed, diff = self._apply_subtree(t, rows, new)
             if summary is not None:
                 pos = None if self._is_working(t['note']) else self._one(
                     'SELECT coalesce(max(catalog_position), 0) + 1 FROM notes WHERE domain = ?', domain)[0]
@@ -697,18 +697,20 @@ class Store:
             done = [r['id'] for r in self._subtree(t)]
             self.db.execute(f'DELETE FROM leases WHERE run_id = ? AND section IN ({",".join("?" * len(done))})', (self.run_id, *done))
             return ({'section_id': t['id'], 'version': t['version'], 'note_version': n['version'], 'changed': bool(changed)},
-                    {'note': t['note'], 'sections': changed}, json.dumps({'op': op, 'before': current}, ensure_ascii=False))
+                    {'note': t['note'], 'sections': changed},
+                    json.dumps({'op': op, 'before': current, 'shape': _shape(content), 'sections': diff}, ensure_ascii=False))
 
         return self._guarded(domain, 'patch_section', task_id, mutate)
 
     def _apply_subtree(self, t, rows, text):
-        """Replace a section's subtree with parsed text; existing subsections keep their ids. Returns changed ids."""
+        """Replace a section's subtree with parsed text; existing subsections keep their ids. Returns the changed ids
+        and {created, changed, removed} ids."""
         base = t['level'] or 0
         own, children, _ = parse_sections(text, base, json.loads(t['heading_path']))
         if t['level'] is None and children and len(self._sections(t['note'])) > 1:  # a root-only page may get its first headings
             raise Refused('headings_not_allowed', hint='the text before the first heading cannot contain headings')
         old = {r['heading_path']: r for r in rows[1:]}
-        changed, order = [], [t['id']]
+        changed, order, created = [], [t['id']], []
         if own != t['body']:
             self.db.execute('UPDATE sections SET body = ?, version = version + 1 WHERE id = ?', (own, t['id']))
             changed.append(t['id'])
@@ -725,6 +727,7 @@ class Store:
                 sid = self.db.insert('sections', {'note': t['note'], 'heading': c['heading'], 'heading_path': key, 'level': c['level'],
                                                   'position': -1, 'body': c['body']})
                 changed.append(sid)
+                created.append(sid)
                 order.append(sid)
         for r in old.values():
             self.db.execute('DELETE FROM sections WHERE id = ?', (r['id'],))
@@ -743,7 +746,8 @@ class Store:
         live = [sid for sid in changed if self._one('SELECT 1 FROM sections WHERE id = ?', sid)]
         self._relink(live)
         self._resolve_dangling(t['note'])
-        return changed
+        removed = [r['id'] for r in old.values()]
+        return changed, {'created': created, 'changed': [i for i in changed if i not in created and i not in removed], 'removed': removed}
 
     def create_note(self, path: str, title: str, summary: str | None = None, body: str = '', decision_status: str | None = None,
                     impl_status: str | None = None, evidence: str | None = None, tags: list[str] | None = None,
@@ -778,7 +782,8 @@ class Store:
             ids = self._insert_sections(path, '\n' + own.strip('\n') + ('\n\n' if own.strip() else ''), secs)
             self._relink(ids)
             self._resolve_dangling(path)
-            return {'path': path, 'version': 1, 'sections': len(ids)}, {'note': path}, None
+            return ({'path': path, 'version': 1, 'sections': len(ids)}, {'note': path},
+                    json.dumps({'note_created': path, 'shape': _shape(body), 'sections': len(ids)}))
 
         return self._guarded(domain, 'create_note', task_id, mutate)
 
@@ -821,7 +826,7 @@ class Store:
             pre = self._one("SELECT id FROM sections WHERE note = ? AND heading_path = '[]'", path)
             self._relink([pre['id']])
             return ({'path': path, 'version': self._note(path)['version'], 'verified_at': new['verified_at']},
-                    {'note': path}, json.dumps({'before': old}, ensure_ascii=False))
+                    {'note': path}, json.dumps({'before': old, 'shape': {k: _shape(v) for k, v in fields.items() if v is not None}}, ensure_ascii=False))
 
         return self._guarded(domain, 'patch_header', task_id, mutate)
 
@@ -1260,6 +1265,12 @@ def _strings(value):
         return [value]
     items = value.values() if isinstance(value, dict) else value if isinstance(value, list) else []
     return [s for v in items for s in _strings(v)]
+
+
+def _shape(text):
+    """What a write carried, without its text: characters, lines and headings."""
+    text = text or ''
+    return {'chars': len(text), 'lines': len(text.splitlines()), 'headings': len(parse_sections(text)[1])}
 
 
 def _words(text):

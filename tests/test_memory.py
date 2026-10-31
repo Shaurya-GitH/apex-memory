@@ -294,6 +294,27 @@ class MemoryTest(unittest.TestCase):
         b.lease('take', path='demo/topic', heading='Rules')
         self.refused('leased', self.s.patch_section, 'append', 'x', path='demo/topic', heading='Rules')  # leases still apply
 
+    def test_write_events_record_the_shape_not_the_text(self):
+        # Real case (memory-ops event 971): a page with an empty body could not be traced; events did not say what was written.
+        self.s.create_note('demo/empty', 'Empty', 'a page', '', 'a', 'b', '2026-10-31 — t')
+        e = json.loads(self.s._one("SELECT body FROM events WHERE op = 'tool:create_note'")[0])
+        self.assertEqual(e, {'note_created': 'demo/empty', 'shape': {'chars': 0, 'lines': 0, 'headings': 0}, 'sections': 1})
+        r = self.s.read('demo/topic', heading='Rules')
+        self.s.patch_section('append', '# Secret one\n\nsecret text\n\n# Secret two\n\nmore', section_id=r['section_id'])
+        e = json.loads(self.s._one("SELECT body FROM events WHERE op = 'tool:patch_section' ORDER BY id DESC LIMIT 1")[0])
+        self.assertEqual((e['op'], e['shape'], len(e['sections']['created']), e['sections']['removed']),
+                         ('append', {'chars': 45, 'lines': 7, 'headings': 2}, 2, []))
+        self.assertEqual(e['sections']['changed'], [])  # the parent and its other subsections kept their text
+        self.assertNotIn('secret', json.dumps({k: v for k, v in e.items() if k != 'before'}))
+        r = self.s.read('demo/topic', heading='Rules')
+        self.s.patch_section('replace', r['content'].split('# Secret one')[0], r['version'], section_id=r['section_id'])
+        e = json.loads(self.s._one("SELECT body FROM events WHERE op = 'tool:patch_section' ORDER BY id DESC LIMIT 1")[0])
+        self.assertEqual((len(e['sections']['removed']), e['sections']['created']), (2, []))
+        n = self.s.read('demo/topic')
+        self.s.patch_header('demo/topic', n['version'], impl_status='built')
+        e = json.loads(self.s._one("SELECT body FROM events WHERE op = 'tool:patch_header'")[0])
+        self.assertEqual(e['shape'], {'impl_status': {'chars': 5, 'lines': 1, 'headings': 0}})
+
     def test_patch_event_keeps_previous_text(self):
         r = self.s.read('demo/topic', heading=['Topic', 'Notes'])
         self.s.patch_section('replace', '\nRewritten.\n\n', r['version'], section_id=r['section_id'], task_id='T1')
