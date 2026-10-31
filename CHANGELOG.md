@@ -27,6 +27,12 @@ Fixes from 16 days of real use (12 to 28 October 2026): about 60 refusals and 17
 - On Postgres, a `regex` pattern that Postgres refuses, for example a repetition count above 255, gets `bad_regex`.
 - Search: `bm25` ranks hits that have more of the query words higher and has a relevance floor. `exact` finds full
   words only. Snippets start and stop at the end of a word.
+- Safe upgrades. Before a store migrates, the store writes a verified backup (`pre-migration-...db`) beside a SQLite
+  store, or in `~/.apex-memory/backups` for Postgres, or in `APEX_MEMORY_BACKUP_DIR`. If the backup fails, the store
+  does not migrate. The migration runs under the writer lock: of two servers that start together, only one migrates.
+  The ops domain gets a `MIGRATION` log entry with the path of the backup.
+- New CLI command `apex-memory status` (read-only) and option `--version`. An old package that opens a newer schema
+  tells you to upgrade the package and restart the MCP client. `backup --to` defaults to `APEX_MEMORY_BACKUP_DIR`.
 - Write events record the shape of each write (characters, lines, headings, sections created, changed and removed,
   note created), not the new text.
 

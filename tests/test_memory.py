@@ -189,6 +189,9 @@ class MemoryTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = pathlib.Path(self.tmp.name)
         self.src = self.dir / 'demo'
+        env = mock.patch.dict(os.environ, {'APEX_MEMORY_BACKUP_DIR': str(self.dir / 'backups')})  # never ~/.apex-memory
+        env.start()
+        self.addCleanup(env.stop)
         for name, text in FIXTURE.items():
             f = self.src / name
             f.parent.mkdir(parents=True, exist_ok=True)
@@ -1190,8 +1193,105 @@ class MemoryTest(unittest.TestCase):
 
     def test_newer_schema_is_refused(self):
         self.s.db.set_schema_version(99)
-        with self.assertRaisesRegex(RuntimeError, 'schema version 99'):
+        with self.assertRaisesRegex(RuntimeError, r'schema version 99.*Upgrade the apex-memory package.*restart the MCP client'):
             Store(self.db, 'test')
+
+    # ----- upgrades: safety backup, one migrator, status -----
+
+    def older_store(self, name='older'):
+        """A store one migration behind, holding this test's knowledge and an ops domain. Returns (url, pages)."""
+        from apex_memory.backends.base import SQL
+        self.s.create_domain('memory-ops', 'Memory ops', 'Failures and friction of the memory system itself.')
+        url = self.new_url(name)
+        old = open_backend(url)
+        files = sorted((SQL / old.name).glob('*.sql'))
+        with old.transaction():
+            for f in files[:-1]:
+                old.run_script(f.read_text())
+            old.set_schema_version(len(files) - 1)
+        copy_store(self.s.db, old)
+        old.close()
+        return url, len(files), {p: self.s.render_note(p) for p in ('demo/topic', 'demo/decisions', 'demo/index')}
+
+    def backups(self):
+        return sorted((self.dir / 'backups').glob('pre-migration-*.db'))
+
+    def test_migration_takes_a_verified_safety_backup_first(self):
+        url, n, pages = self.older_store()
+        s = Store(url, 'test')
+        self.addCleanup(s.db.close)
+        self.assertEqual(s.db.schema_version(), n)
+        [bk] = self.backups()
+        self.assertRegex(bk.name, rf'^pre-migration-\d{{8}}-\d{{6}}-v{n - 1}-to-v{n}\.db$')
+        ev = s._q("SELECT op, refs FROM events WHERE domain = 'memory-ops' AND op LIKE 'MIGRATION%'")
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(json.loads(ev[0]['refs']), {'from': n - 1, 'to': n, 'backup': str(bk)})
+        self.assertEqual({p: s.render_note(p) for p in pages}, pages)
+        restored = Store(self.new_url('restored'), 'test')  # the README's rollback: import the backup into a new store
+        self.addCleanup(restored.db.close)
+        src = open_backend(str(bk))
+        copy_store(src, restored.db)
+        src.close()
+        self.assertEqual({p: restored.render_note(p) for p in pages}, pages)
+        again = Store(url, 'test')  # nothing pending: no second backup, no second event
+        again.db.close()
+        self.assertEqual((len(self.backups()), len(s._q("SELECT id FROM events WHERE op LIKE 'MIGRATION%'"))), (1, 1))
+
+    def test_failed_safety_backup_leaves_the_store_unmigrated(self):
+        url, n, _ = self.older_store()
+        blocker = self.dir / 'not-a-folder'
+        blocker.write_text('x')
+        with mock.patch.dict(os.environ, {'APEX_MEMORY_BACKUP_DIR': str(blocker)}):
+            with self.assertRaisesRegex(RuntimeError, r'safety backup .* failed.*not migrated'):
+                Store(url, 'test')
+        db = open_backend(url)
+        self.addCleanup(db.close)
+        self.assertEqual(db.schema_version(), n - 1)
+
+    def test_two_processes_migrate_once(self):
+        url, n, _ = self.older_store()
+        code = 'import sys; from apex_memory.store import Store; Store(sys.argv[1], "p").db.close()'
+        procs = [subprocess.Popen([sys.executable, '-c', code, url], cwd=ROOT, stderr=subprocess.PIPE, text=True) for _ in range(2)]
+        errs = [p.communicate(timeout=60)[1] for p in procs]
+        self.assertEqual([p.returncode for p in procs], [0, 0], errs)
+        s = Store(url, 'test')
+        self.addCleanup(s.db.close)
+        self.assertEqual((s.db.schema_version(), len(self.backups()), len(s._q("SELECT id FROM events WHERE op LIKE 'MIGRATION%'"))), (n, 1, 1))
+
+    def test_sqlite_safety_backup_goes_next_to_the_store(self):
+        if self.s.db.name != 'sqlite':
+            self.skipTest('the default folder for Postgres is ~/.apex-memory/backups, which a test must not touch')
+        url, n, _ = self.older_store()
+        with mock.patch.dict(os.environ):
+            os.environ.pop('APEX_MEMORY_BACKUP_DIR')
+            Store(url, 'test').db.close()
+        self.assertEqual(len(list((pathlib.Path(url).parent / 'backups').glob(f'pre-migration-*-v{n - 1}-to-v{n}.db'))), 1)
+
+    def test_version_and_status_cli(self):
+        import importlib.metadata
+        version = importlib.metadata.version('apex-memory')
+        out = cli('--version')
+        self.assertEqual((out.returncode, out.stdout.strip()), (0, f'apex-memory {version}'), out.stderr)
+        url, n, _ = self.older_store()
+        out = cli('status', '--url', url)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn(f'apex-memory {version}', out.stdout)
+        self.assertIn(f'schema version {n - 1}; this apex-memory knows {n}: 1 pending migration', out.stdout)
+        self.assertIn('last backup: none', out.stdout)
+        self.assertNotIn(':test@', out.stdout)  # no password
+        db = open_backend(url)
+        self.assertEqual(db.schema_version(), n - 1)  # status is read-only
+        db.close()
+        Store(url, 'test').db.close()
+        out = cli('status', '--url', url)
+        self.assertIn(f'schema version {n}; this apex-memory knows {n}: up to date', out.stdout)
+        self.assertIn(f'last backup: {self.backups()[0]}', out.stdout)
+        if self.s.db.name == 'sqlite':
+            missing = self.dir / 'missing.db'
+            out = cli('status', '--url', str(missing))
+            self.assertEqual(out.returncode, 1)
+            self.assertIn('no store', out.stdout + out.stderr)
+            self.assertFalse(missing.exists())
 
     def test_init_cli(self):
         url = self.new_url('init')

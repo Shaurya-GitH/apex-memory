@@ -107,7 +107,14 @@ class SqliteBackend(Backend):
                 buf = ''
 
     def backup(self, destination):
-        self.db.execute('VACUUM INTO ?', (str(destination),))
+        # Its own connection: VACUUM INTO cannot run inside a transaction, and the pre-migration backup runs while
+        # this connection holds the write lock (WAL lets the reader see the last commit).
+        db = sqlite3.connect(self.location, isolation_level=None)
+        try:
+            db.execute('PRAGMA busy_timeout=5000')
+            db.execute('VACUUM INTO ?', (str(destination),))
+        finally:
+            db.close()
         check_integrity(destination)
 
     def close(self):

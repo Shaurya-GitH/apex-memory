@@ -66,12 +66,17 @@ class Backend(abc.ABC):
     def run_script(self, sql: str):
         """Run one migration file (several statements, no arguments)."""
 
+    def migrations(self) -> list:
+        return sorted((SQL / self.name).glob('*.sql'))
+
     def migrate(self) -> bool:
         """Apply the pending migrations in order, inside transaction(). Returns True when the database was empty."""
-        files = sorted((SQL / self.name).glob('*.sql'))
+        files = self.migrations()
         version = self.schema_version()
         if version > len(files):
-            raise RuntimeError(f'{self.location} has schema version {version}; this apex-memory knows {len(files)}: upgrade it')
+            from .. import package_version
+            raise RuntimeError(f'{self.location} has schema version {version}, but apex-memory {package_version()} knows only {len(files)}: '
+                               'a newer apex-memory wrote it. Upgrade the apex-memory package (README: Upgrade), then restart the MCP client.')
         for f in files[version:]:
             self.run_script(f.read_text())
         if version < len(files):

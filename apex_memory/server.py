@@ -53,7 +53,11 @@ def main(argv=None):
     p.add_argument('--run-id', default=None)
     p.add_argument('--ops-domain', default=OPS_DOMAIN, help='domain that receives automatic records of refusals and errors')
     args = p.parse_args(argv)
-    build(Store(args.url, args.actor, args.role, args.run_id, args.ops_domain)).run('stdio')
+    try:
+        store = Store(args.url, args.actor, args.role, args.run_id, args.ops_domain)
+    except (ConnectionError, RuntimeError) as e:  # unreachable, newer schema, failed safety backup: say why, on stderr
+        raise SystemExit(f'apex-memory: {e}')
+    build(store).run('stdio')
 
 
 if __name__ == '__main__':

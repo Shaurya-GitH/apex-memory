@@ -29,6 +29,7 @@ The project started as a part of a private project. This repository is the publi
 - [Import a folder of markdown notes](#import-a-folder-of-markdown-notes)
 - [Move a store from SQLite to Postgres](#move-a-store-from-sqlite-to-postgres)
 - [Backups](#backups)
+- [Upgrade](#upgrade)
 - [Differences between the backends](#differences-between-the-backends)
 - [Run the tests](#run-the-tests)
 - [Verify a change](#verify-a-change)
@@ -518,6 +519,8 @@ The CLI uses the same database rules as the server. All commands accept `--url`.
 | `apex-memory brief <domain>` | Prints the brief of a domain. |
 | `apex-memory check <domain>` | Prints the problems of a domain. The exit code is 1 if there are problems. |
 | `apex-memory backup [--to <folder>] [--keep <n>]` | Writes a verified backup. See [Backups](#backups). |
+| `apex-memory status` | Shows the package version, the schema version of the store, the pending migrations, the location of the store and the last backup. It does not change the store. See [Upgrade](#upgrade). |
+| `apex-memory --version` | Shows the package version. |
 
 ## Import a folder of markdown notes
 
@@ -582,7 +585,7 @@ The same command moves a store from Postgres to SQLite, or from SQLite to SQLite
 apex-memory backup --to ~/.apex-memory/backups --keep 14
 ```
 
-The command writes `<folder>/memory-YYYY-MM-DD.db`. Each backup is a SQLite file. The command does an integrity check of the file before it keeps it. It then deletes the oldest backups and keeps the newest `--keep` files. A second backup on the same day replaces the first one.
+If you do not give `--to`, the command uses `APEX_MEMORY_BACKUP_DIR`, then `~/.apex-memory/backups`. The command writes `<folder>/memory-YYYY-MM-DD.db`. Each backup is a SQLite file. The command does an integrity check of the file before it keeps it. It then deletes the oldest backups and keeps the newest `--keep` files. A second backup on the same day replaces the first one.
 
 | Backend | How the backup works |
 | --- | --- |
@@ -621,6 +624,81 @@ The agent runs the command in a zsh login shell. Thus `~/.zprofile` or `~/.zshen
 4. Read `/tmp/apex-memory-backup.log`. Make sure that it shows the path of a new backup.
 
 On Linux, use cron or a systemd timer to run the same command.
+
+## Upgrade
+
+An upgrade is one command and a restart. The store keeps all the knowledge. Before the new version changes the schema, it writes a backup.
+
+### Upgrade the package
+
+1. Upgrade the package. Use the command for the installer that you used:
+
+   | Installer | Command |
+   | --- | --- |
+   | uv | `uv tool upgrade apex-memory` |
+   | pip | `pip install --upgrade --force-reinstall "git+https://github.com/Shaurya-GitH/apex-memory"` |
+
+   `uv tool upgrade` gets the newest commit of the branch that you installed. pip needs `--force-reinstall`. Without it, pip does not get a new commit that has the same version number.
+
+2. Restart each MCP client, or run `/mcp` and reconnect the server. The client then starts the new server.
+3. Run `apex-memory status`. The line `schema version` must show `up to date`.
+
+To install one release, give its tag:
+
+```sh
+uv tool install "git+https://github.com/Shaurya-GitH/apex-memory@v0.2.0"
+```
+
+When you install a tag, `uv tool upgrade` does not change the version. To follow the branch again, run `uv tool install "git+https://github.com/Shaurya-GitH/apex-memory"`.
+
+### What occurs automatically
+
+The first time that the new version opens a store with an older schema, it does these steps:
+
+1. It gets the writer lock of the store. If two servers start at the same time, only one of them does the next steps. The other server waits, then uses the new schema.
+2. It writes a backup of the store to `pre-migration-YYYYMMDD-HHMMSS-v<old>-to-v<new>.db`, and does an integrity check of the backup.
+   - SQLite: the backup goes into the folder `backups` next to the store file.
+   - Postgres: the backup is a SQLite file in `~/.apex-memory/backups`.
+   - If `APEX_MEMORY_BACKUP_DIR` is set, the backup goes into that folder for both backends.
+3. It applies the migrations.
+4. If the ops domain exists, it appends a log entry `MIGRATION: schema <old> to <new>` to the ops domain. The entry gives the path of the backup.
+
+If the backup fails, the store does not change. The server stops and tells why. Make disk space available, or set `APEX_MEMORY_BACKUP_DIR` to a folder that you can write to. Then start the server again.
+
+The store does not delete pre-migration backups. Delete old ones yourself when you do not need them.
+
+If an old version of the package opens a store that a newer version changed, the old version stops. Upgrade the package and restart the MCP client.
+
+### Do a check of the store
+
+```sh
+apex-memory status
+```
+
+The command does not change the store. It shows:
+
+- The version of the package.
+- The location of the store, without a password, and the store id.
+- The schema version of the store, and the number of migrations that this package knows. If migrations are pending, the next start of the server applies them.
+- The newest backup in the backup folders.
+
+### Roll back
+
+1. Install the old version. For example:
+
+   ```sh
+   uv tool install "git+https://github.com/Shaurya-GitH/apex-memory@v0.1.0"
+   ```
+
+2. Import the pre-migration backup into a new, empty store:
+
+   ```sh
+   apex-memory import ~/.apex-memory/backups/pre-migration-20261031-120000-v1-to-v2.db --url sqlite:///Users/you/.apex-memory/rolled-back.db
+   ```
+
+3. Set `APEX_MEMORY_URL` to the new store in each MCP client. Restart the clients.
+
+The knowledge that agents wrote after the upgrade is not in the backup.
 
 ## Differences between the backends
 

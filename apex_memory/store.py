@@ -6,7 +6,8 @@ guard). The database is reached only through a backend (apex_memory.backends); t
 """
 import collections, contextlib, datetime, difflib, functools, inspect, json, re, threading, unicodedata, uuid
 
-from .backends import open_backend
+from . import package_version
+from .backends import backup, open_backend, safety_backup_dir
 
 STALE_DAYS = 14        # a verify_live source older than this is flagged
 DUP_MIN = 200          # paragraphs at least this long count as a claim for the duplicate check
@@ -162,16 +163,32 @@ class Store:
         self.db = open_backend(url)
         self.location = self.db.location
         try:
-            with self._write():
+            with self._write():  # under the writer lock: of two servers started together, one migrates
+                version, known = self.db.schema_version(), len(self.db.migrations())
+                saved = self._safety_backup(version, known) if 0 < version < known else None
                 if self.db.migrate():
                     for key, value in (('store_id', str(uuid.uuid4())), ('created_at', today())):
                         self.db.execute('INSERT INTO meta VALUES (?, ?)', (key, value))
+                if saved and self._one('SELECT 1 FROM notes WHERE domain = ? LIMIT 1', self.ops_domain):
+                    self._event(self.ops_domain, f'MIGRATION: schema {version} to {known}', {'from': version, 'to': known, 'backup': saved},
+                                f'\n- **Source / reason:** apex-memory {package_version()} opened the store at schema {version}\n'
+                                f'- **Outcome:** migrated to schema {known}; safety backup {saved}\n\n')
             self.store_id = self._one("SELECT value FROM meta WHERE key='store_id'")[0]
         except BaseException:
             self.db.close()
             raise
 
     # ----- plumbing -----
+
+    def _safety_backup(self, version, known):
+        """A verified backup before pending migrations run; on failure nothing is migrated."""
+        to = safety_backup_dir(self.db)
+        try:
+            return str(backup(self.db, to, name=f'pre-migration-{datetime.datetime.now():%Y%m%d-%H%M%S}-v{version}-to-v{known}.db'))
+        except Exception as e:
+            raise RuntimeError(f'{self.location} needs migration from schema {version} to {known}, but the safety backup to {to} failed '
+                               f'({type(e).__name__}: {e}); the store is not migrated. Free disk space or set APEX_MEMORY_BACKUP_DIR '
+                               'to a writable folder, then start again.') from e
 
     @contextlib.contextmanager
     def _write(self):

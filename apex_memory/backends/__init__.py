@@ -57,11 +57,25 @@ def copy_store(src: Backend, dst: Backend) -> dict:
     return counts
 
 
-def backup(db: Backend, to_dir, keep: int = 14) -> pathlib.Path:
-    """A verified copy of the store as to_dir/memory-YYYY-MM-DD.db (a SQLite file); keeps the newest `keep`."""
+def default_backup_dir() -> str:
+    """$APEX_MEMORY_BACKUP_DIR, else ~/.apex-memory/backups."""
+    return os.environ.get('APEX_MEMORY_BACKUP_DIR') or '~/.apex-memory/backups'
+
+
+def safety_backup_dir(db: Backend) -> pathlib.Path:
+    """Where the backup before a migration goes: $APEX_MEMORY_BACKUP_DIR, else beside a SQLite store, else
+    ~/.apex-memory/backups."""
+    if os.environ.get('APEX_MEMORY_BACKUP_DIR') or db.name != 'sqlite':
+        return pathlib.Path(default_backup_dir()).expanduser()
+    return pathlib.Path(db.location).parent / 'backups'
+
+
+def backup(db: Backend, to_dir, keep: int = 14, name: str | None = None) -> pathlib.Path:
+    """A verified copy of the store as to_dir/memory-YYYY-MM-DD.db (a SQLite file); keeps the newest `keep`. With
+    name, writes to_dir/name and prunes nothing."""
     to = pathlib.Path(to_dir).expanduser()
     to.mkdir(parents=True, exist_ok=True)
-    final = to / f'memory-{datetime.date.today().isoformat()}.db'
+    final = to / (name or f'memory-{datetime.date.today().isoformat()}.db')
     tmp = to / f'.{final.name}.tmp'
     tmp.unlink(missing_ok=True)
     try:
@@ -70,6 +84,6 @@ def backup(db: Backend, to_dir, keep: int = 14) -> pathlib.Path:
         tmp.unlink(missing_ok=True)
         raise
     os.replace(tmp, final)
-    for old in sorted(to.glob('memory-*.db'))[:-keep]:
+    for old in ([] if name else sorted(to.glob('memory-*.db'))[:-keep]):
         old.unlink()
     return final
