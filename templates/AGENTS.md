@@ -1,19 +1,20 @@
 # Agent rules for an apex-memory store
 
-> **How to use this template.** These are rules for agents that use an apex-memory store through MCP. Copy this file into your own `AGENTS.md` or `CLAUDE.md`. Replace each placeholder in angle brackets: `<server-name>`, `<domain-a>`, `<ops-domain>` and the others. Remove the domains that you do not use, and remove this note. Keep one copy of these rules. If two agents read them, let one file import or link the other. The tool names are the names that the server gives. Your client can add a prefix, for example `mcp__<server-name>__brief`.
+> **How to use this template.** These are rules for agents that use an apex-memory store through MCP. Copy this file into your own `AGENTS.md` or `CLAUDE.md`. Replace the placeholders `<server-name>`, `<date>`, `<database URL or path>` and `<archive path>`. Do not write a list of domains here: the store gives the domains and their descriptions. Remove this note. Keep one copy of these rules. If two agents read them, let one file import or link the other. The tool names are the names that the server gives. Your client can add a prefix, for example `mcp__<server-name>__brief`.
 
 ## Select the relevant domain
 
-Since `<date>`, all knowledge lives in the apex-memory store at `<database URL or path>`. Use only the `<server-name>` MCP tools to get to it. Select knowledge by the domain of the task, not by the repository or the tool name. Use only the relevant domain for project context and log entries.
+Since `<date>`, all knowledge lives in the apex-memory store at `<database URL or path>`. Use only the `<server-name>` MCP tools to get to it.
 
-| Domain | Use it for |
-| --- | --- |
-| `<domain-a>` | `<the product, project or area that this domain holds>` |
-| `<domain-b>` | `<the product, project or area that this domain holds>` |
-| `<ops-domain>` | The failures and friction of the memory system itself. See [Report memory-system problems](#report-memory-system-problems). |
+1. At the start of a task, call `list_domains`. The result gives each domain with its description.
+2. Select the domains whose description agrees with the subject of the task. Select by subject, not by the repository or the tool name.
+3. Call `brief` for each domain that you selected.
+4. If no description agrees with the task, ask the owner before you call `create_domain`. Do not put the knowledge in an unrelated domain.
 
-- For a new domain, ask the owner before you create it. Do not put its knowledge in an unrelated domain.
-- Each domain has its own index, status, append-only log, decision records and authoritative topic owners.
+- The domain with `ops: true` holds the failures and friction of the memory system itself. See [Report memory-system problems](#report-memory-system-problems).
+- Use only the relevant domain for project context and log entries.
+- Each domain has its own description, index, status, append-only log, decision records and authoritative topic owners.
+- Keep the description of a domain current. When the scope of a domain changes, change the summary of `<domain>/index`. Write what the domain holds and when to select it, for example "Not for X; use Y".
 - Do not read a domain only because the code is in a related repository. Do not log generic work in a project domain.
 - Read another domain only for an explicit cross-domain dependency. Link to its authoritative owner. Do not copy its contracts.
 - Repository instructions still govern their code. These rules for knowledge do not give permission for unrelated changes to an application.
@@ -21,16 +22,20 @@ Since `<date>`, all knowledge lives in the apex-memory store at `<database URL o
 ## Use the memory store
 
 - Do not read or write knowledge in other places, such as local markdown files or other note tools. If you keep an archive of old notes at `<archive path>`, it is history only. It is not a source.
-- At the start of a relevant task or session, call `brief("<domain>")`. Call it again after each context reset or compaction, because a summary does not keep it. The brief gives the store identity, the open check problems and the index. It also gives decisions by status, open status items, owner preferences and the last 10 log entries in full. Use one brief for many questions. Get a new brief when relevant knowledge changes.
-- Find, then read only what you need. Use `search` with `mode` `bm25` for topics, `exact` for ids, hashes and paths, and `regex` for patterns. Give a `scope`: a domain or a folder. Then `read` one section.
+- At the start of a relevant task or session, call `brief(domain)` for the domain that you selected. Call it again after each context reset or compaction, because a summary does not keep it. The brief gives the store identity, the open check problems and the index. It also gives decisions by status, open status items, owner preferences and the last 10 log entries in full. Use one brief for many questions. Get a new brief when relevant knowledge changes.
+- Find, then read only what you need. Use `search` with `mode` `bm25` for topics, `exact` for full ids, hashes and paths, and `regex` for patterns. Give a `scope`: a domain or a folder. Then `read` one section.
+- If `read` cannot find a heading or a note, the refusal gives `candidates`. Use one of them.
 - Use `links` to see the links into a note and out of it. Use `log_query` to filter the log by time, op, page or task.
 - Read a maximum of three sections in one batch, unless you need more. Stop when you have sufficient evidence for the question.
-- Write with the version that `read` gave. In `patch_section`, `replace` accepts exactly what `read` returned for a section, subsections included. `append` can add subsections. Heading levels are relative to the section.
+- Write with the version that `read` gave. In `patch_section`, `replace` accepts exactly what `read` returned for a section, subsections included. Heading levels are relative to the section.
+- `append` can add subsections. It does not need a version.
+- To change only the text before the first subsection, use `replace_own_text`. The subsections do not change.
+- To make two or more writes together, use `batch`. For example, use it for two notes that link to each other. If one write is refused, the store rolls back all of them.
 - Use `patch_header` for the decision status, implementation status, evidence and verified date of a note. Use `create_note` for a new page. A new page needs a summary and a page header. `create_note` never overwrites. Use `move` to rename a note. The links follow the note.
-- Use `status_item`, `set_decision_status` and `log_append`. Do not edit a status item, the Status line of a decision or the log by hand.
+- Use `status_item`, `set_decision_status` and `log_append`. Do not edit a status item, the Status line of a decision or the log by hand. To change the text of an open status item, use `status_item` with `update`.
 - Take a `lease` before a long edit of a shared section.
 - Each write is all or nothing and does the checks itself. A refusal gives the reason. For a version conflict, read again and merge. For a failed check, correct the problem that the refusal names. Do not write the knowledge in a different place to get around a refusal.
-- `check("<domain>")` lists the open problems of a domain.
+- `check(domain)` lists the open problems of a domain.
 - Put scratch work under `<domain>/working/<actor>/`. It becomes project knowledge only when the owner promotes it with `move`.
 - When the owner tells you how to do work, record it with `preference`. Quote the words of the owner.
 - Before you act on implementation facts that can change, do a check of the real repository, branch, code and deployed configuration. Keep these apart: agreed scope, local behavior that you verified in the source, configuration snapshots, proposals, historical or superseded claims, and unknowns. The store is not proof of a deployment or of a test result.
@@ -38,20 +43,20 @@ Since `<date>`, all knowledge lives in the apex-memory store at `<database URL o
 
 ## Report memory-system problems
 
-- The store records each tool refusal and each error in `<ops-domain>` automatically.
+- The ops domain is the domain that `list_domains` marks with `ops: true`. The store records each tool refusal and each error in it automatically.
 - Also record each problem with the memory system immediately. Examples: the system fails, refuses a correct write, needs too many calls, misses in search or does not have a tool. Use `log_append`:
 
   ```text
   log_append(
-    domain="<ops-domain>",
+    domain=<the ops domain>,
     op="FAILURE: ..." | "WRONG REFUSAL: ..." | "FRICTION: ..." | "SEARCH MISS: ..." | "MISSING TOOL: ..." | "IDEA: ...",
-    pages=[the pages involved, or "<ops-domain>/log"],
+    pages=[the pages involved, or the log page of the ops domain],
     source=<what you did>,
     outcome=<what occurred, and the workaround>,
   )
   ```
 
-- If the memory server is not available, tell the owner. Continue the work that does not need the store. Keep the knowledge edits that you could not do in your reply, and mark them as not done. When the server is available again, record the outage in `<ops-domain>`. Do not write the knowledge in a different place.
+- If the memory server is not available, tell the owner. Continue the work that does not need the store. Keep the knowledge edits that you could not do in your reply, and mark them as not done. When the server is available again, record the outage in the ops domain. Do not write the knowledge in a different place.
 
 ## Retrieval and decision checkpoints
 
@@ -59,6 +64,7 @@ Since `<date>`, all knowledge lives in the apex-memory store at `<database URL o
 - If sources do not agree, keep the latest explicit decision of the owner apart from the current implementation. Do not join them by inference.
 - When the owner explicitly accepts or corrects a decision, record the decision before you close the topic.
 - In a domain whose decision records have a `- **Status:**` line, add the record with its Status line. Change the status later only with `set_decision_status`.
+- If a decision was accepted in error, set it to `void` with `set_decision_status` and give the reason. Do not make a new record only to supersede it.
 - Record alternatives that the owner did not accept as proposals, not as accepted contracts.
 - Batch routine reads. Do not wait until the end of the session to update accepted contracts.
 

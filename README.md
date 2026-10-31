@@ -37,7 +37,7 @@ The project started as a part of a private project. This repository is the publi
 
 ## Quick start for agents
 
-This procedure installs the store with SQLite, creates one domain and connects Claude Code. For other MCP clients, see [Connect an MCP client](#connect-an-mcp-client).
+This procedure installs the store with SQLite, connects Claude Code and creates one domain. For other MCP clients, see [Connect an MCP client](#connect-an-mcp-client).
 
 1. Make sure that `uv` is installed. Run `uv --version`. If the command fails, install uv from <https://docs.astral.sh/uv/>.
 2. Install the package from GitHub:
@@ -53,24 +53,19 @@ This procedure installs the store with SQLite, creates one domain and connects C
    apex-memory init
    ```
 
-5. Create the first domain. Use the first script in [Create a domain](#create-a-domain). Replace `myproject` with the name of your domain.
-6. Create the ops domain `memory-ops`. Use the second script in [Create a domain](#create-a-domain). The store records refusals and errors there.
-7. Do a check of the import:
-
-   ```sh
-   apex-memory verify ~/apex-notes/myproject
-   apex-memory brief myproject
-   ```
-
-8. Register the MCP server for all of your projects. Replace `claude-code` with a short name for the agent.
+5. Register the MCP server for all of your projects. Replace `claude-code` with a short name for the agent.
 
    ```sh
    claude mcp add apex-memory --scope user -- apex-memory serve --actor claude-code --role owner
    ```
 
-9. Start a new Claude Code session. Run `/mcp` and make sure that `apex-memory` shows as connected.
-10. Copy [templates/AGENTS.md](templates/AGENTS.md) into your own `AGENTS.md` or `CLAUDE.md`. Replace its placeholders.
-11. In the new session, call the tool `brief` with `domain` set to your domain.
+6. Start a new Claude Code session. Run `/mcp` and make sure that `apex-memory` shows as connected.
+7. In the session, tell the agent to create your first domain with the tool `create_domain`. Give a name, a title and a description. See [Create a domain](#create-a-domain).
+8. Tell the agent to create the ops domain `memory-ops` with `create_domain`. The store records refusals and errors there.
+9. Copy [templates/AGENTS.md](templates/AGENTS.md) into your own `AGENTS.md` or `CLAUDE.md`. Replace its placeholders.
+10. In a new session, the agent calls `list_domains`. It selects the domain whose description agrees with the task. Then it calls `brief` with that domain.
+
+If you have a folder of markdown notes, you can import it as a domain. See [Import a folder of markdown notes](#import-a-folder-of-markdown-notes).
 
 ## Token cost
 
@@ -103,17 +98,17 @@ The store keeps knowledge in domains. A domain is one area of knowledge, for exa
 
 | Item | What it is |
 | --- | --- |
-| Domain | A set of notes with the path prefix `<domain>/`. Each domain has its own index, status page, log and decision records. You create a domain with `apex-memory import`. |
+| Domain | A set of notes with the path prefix `<domain>/`. Each domain has its own description, index, status page, log and decision records. You create a domain with `create_domain`, or with `apex-memory import` from a folder of markdown notes. |
 | Note | One markdown page with a path such as `<domain>/topics/storage`. A note has a title, a summary and a version. A project note also has a page header. |
 | Page header | Three fields on a project note: decision status, implementation status and evidence checked. The store also keeps the date `verified_at`. |
-| Index | The page `<domain>/index`. Its catalog table shows one line for each note: the link and the summary. The store makes the catalog from the summaries. |
+| Index | The page `<domain>/index`. Its catalog table shows one line for each note: the link and the summary. The store makes the catalog from the summaries. The summary of the index is the description of the domain. `list_domains` shows it. |
 | Section | One heading of a note and its text. Each section has an id and a version. You read and edit one section at a time. |
 | Link | `[[<domain>/<note>]]`, `[[<domain>/<note>#Heading]]` or `[[<note>#^block]]` in the text. The store keeps the links in the two directions. `move` rewrites them in notes. The index catalog and the log are generated from rows, so their links are not stored as links. Log entries keep the old page name after a `move`. |
 | Decision record | A heading such as `D01 — Use SQLite (2026-10-30)` on the page `<domain>/decisions`. It has one `- **Status:**` line. |
-| Decision status | `proposed`, `accepted`, `rejected` or `superseded by Dnn`. Only `set_decision_status` changes the Status line. |
+| Decision status | `proposed`, `accepted`, `rejected`, `superseded by Dnn` or `void`. Only `set_decision_status` changes the Status line. |
 | Status item | One item on the page `<domain>/status`. The kinds are `state`, `open`, `blocker` and `next`. |
 | Log | The page `<domain>/log`. It is append-only. The database stamps the time of each entry. |
-| Tool event | An automatic log record of each write and each search. The log page does not show tool events. `log_query` shows them on request. |
+| Tool event | An automatic log record of each write and each search. A write event records the shape of the write: the size in characters and lines, the number of headings, and the sections that the write created, changed or removed. It does not record the new text. The log page does not show tool events. `log_query` shows them on request. |
 | Source | A record of where knowledge came from: `snapshot`, `live`, `transcript`, `web` or `owner`. A note can cite a source. |
 | Preference | A rule from the owner about how to do work, with the words of the owner. Each brief shows the active preferences. |
 | Lease | A claim on a section for 1 to 60 minutes. A longer time becomes 60 minutes. Other agents cannot write to that section while the lease is active. |
@@ -126,11 +121,17 @@ The store does a check of a domain before and after each write. The check finds 
 
 - Broken links, and anchors that the store cannot find.
 - Notes that have no summary, so they are not in the index.
+- An index that has no summary, so the domain has no description.
 - The same paragraph of 200 characters or more in two notes.
 - Decision records that do not have exactly one Status line.
 - Notes that cite a `live` source, with a `verified_at` date older than 14 days.
 
 If a write adds a new problem, the store rolls back the write. The refusal `check_failed` lists the problems. Problems that were there before the write do not stop it. The tool `check` and the command `apex-memory check` show all the problems of a domain.
+
+These rules tell when a problem is new:
+
+- The store counts the copies of each paragraph. A write that removes one copy is permitted. A write that adds a copy, or that makes a new duplicate paragraph, is refused.
+- A domain starts to use Status lines when one record gets a Status line. After that, the older records without a Status line are old problems. A new record without a Status line is a new problem.
 
 ### Decision records
 
@@ -146,9 +147,10 @@ These rules apply to decision records:
 
 - You cannot delete a record. Supersede it with `set_decision_status`.
 - Only `set_decision_status` changes the Status line.
-- You can edit a `proposed` record. You can only append text to an `accepted`, `rejected` or superseded record.
-- The status can change from `proposed` to `accepted`, `rejected` or `superseded`. It can change from `accepted` to `superseded`.
+- You can edit a `proposed` record. You can only append text to an `accepted`, `rejected`, `void` or superseded record.
+- The status can change from `proposed` to `accepted`, `rejected` or `superseded`. It can change from `accepted` to `superseded` or `void`.
 - `superseded_by` must name an accepted decision.
+- Use `void` only when an acceptance was an error. `void` needs a `reason`. The record stays on the page. The store adds a `- **Void reason:**` line with the reason and the date. The brief shows void decisions on a line of their own.
 
 ## Install
 
@@ -248,70 +250,41 @@ If the `postgres` extra is not installed, a Postgres URL stops with the message 
 
 ## Create a domain
 
-No MCP tool creates a domain. You create a domain when you import a folder of markdown notes. The name of the folder is the name of the domain. Use lowercase letters, digits and hyphens.
+The owner creates a domain with the tool `create_domain`. A worker cannot create a domain.
 
-This script writes the four start pages of a new domain and imports them. Change `DOMAIN` and `NOTES` as necessary.
-
-```sh
-DOMAIN=myproject
-NOTES=~/apex-notes
-mkdir -p "$NOTES/$DOMAIN"
-cat > "$NOTES/$DOMAIN/index.md" <<EOF
-# $DOMAIN index
-
-## Catalog
-
-| Page | Purpose |
-|---|---|
-| [[$DOMAIN/decisions]] | Decision records |
-| [[$DOMAIN/status]] | Current state |
-| [[$DOMAIN/log]] | Append-only activity |
-EOF
-cat > "$NOTES/$DOMAIN/status.md" <<EOF
-# $DOMAIN status
-
-## Current state
-
-None.
-
-## Unfinished / open
-
-None.
-
-## Blockers
-
-None.
-
-## Next concrete action
-
-None.
-EOF
-printf '# %s log\n' "$DOMAIN" > "$NOTES/$DOMAIN/log.md"
-printf '# %s decisions\n' "$DOMAIN" > "$NOTES/$DOMAIN/decisions.md"
-apex-memory import "$NOTES/$DOMAIN"
+```text
+create_domain(
+  domain="myproject",
+  title="My project",
+  description="The My project product: its plans, contracts and decisions. Not for the website; use website.",
+)
 ```
 
-The store records refusals and errors only when the ops domain exists. This script creates the ops domain `memory-ops`:
+| Argument | What it is |
+| --- | --- |
+| `domain` | The name of the domain. Use lowercase letters, digits and hyphens. |
+| `title` | The name that the start pages show. |
+| `description` | What the domain holds and when to select it. Agents read it in `list_domains`. Write the limits too, for example "Not for X; use Y". The store keeps it as the summary of `<domain>/index`. |
 
-```sh
-NOTES=~/apex-notes
-mkdir -p "$NOTES/memory-ops"
-cat > "$NOTES/memory-ops/index.md" <<'EOF'
-# memory-ops index
+`create_domain` makes four start pages: `<domain>/index` with its catalog, `<domain>/status`, `<domain>/log` and `<domain>/decisions`. If the domain exists, the refusal is `domain_exists`.
 
-## Catalog
+The store records refusals and errors only when the ops domain exists. Create the ops domain `memory-ops` in the same way:
 
-| Page | Purpose |
-|---|---|
-| [[memory-ops/log]] | Failures and friction of the memory system |
-EOF
-printf '# memory-ops log\n' > "$NOTES/memory-ops/log.md"
-apex-memory import "$NOTES/memory-ops"
+```text
+create_domain(
+  domain="memory-ops",
+  title="Memory ops",
+  description="Failures and friction of the memory system itself. Not for project knowledge.",
+)
 ```
 
 To use a different name for the ops domain, give `--ops-domain <name>` to `apex-memory serve`.
 
-After the import, the store holds the knowledge. The folder is only the start point. Agents add notes with `create_note`.
+Keep the description current. When the scope of a domain changes, change the summary of `<domain>/index`. Use `patch_section` with `summary` on a section of the index. For example, use `op: "replace_own_text"` on the first heading of the index, with its own text unchanged.
+
+A domain that you imported from markdown has no description. `list_domains` then shows the first paragraph of its index, with `description_missing: true`. The check shows the problem until you give a summary to the index.
+
+To import a folder of markdown notes as a domain, see [Import a folder of markdown notes](#import-a-folder-of-markdown-notes).
 
 ## Connect an MCP client
 
@@ -329,7 +302,7 @@ apex-memory serve --actor <name> --role <owner or worker>
 | `--ops-domain <name>` | The domain that gets the records of refusals and errors. The default is `memory-ops`. |
 | `--run-id <id>` | An id for this run. The default is a new UUID. Log entries keep it. |
 
-When the client connects, the server sends instructions to the agent. The instructions give the store id, the actor, the role and the main rules.
+When the client connects, the server sends instructions to the agent. The instructions start with the rule for domains: call `list_domains`, select the domains whose description agrees with the task, then call `brief`. If no domain agrees, ask the owner before you call `create_domain`. The instructions also give the store id, the actor, the role and the main rules.
 
 ### Claude Code
 
@@ -382,7 +355,8 @@ You give the role when you register the server. The store does not authenticate 
 A worker cannot do these actions:
 
 - Write a project note, a page header or a section outside its working notes.
-- Add or close a status item.
+- Create a domain.
+- Add, update or close a status item.
 - Change a decision status.
 - Add or retire a preference.
 - Promote a working note into project knowledge.
@@ -398,22 +372,25 @@ Each tool returns a JSON object. A result has `"ok": true`. A refusal has `"ok":
 
 | Tool | What it does |
 | --- | --- |
+| `list_domains` | Shows each domain with its description, number of notes and time of the last log entry. `ops: true` marks the ops domain. All roles. |
 | `brief` | Gives the start read for a domain: store identity, number of problems, index, preferences, decisions, open status items and the last log entries. |
 | `search` | Finds text in notes, sections and log entries. `mode` is `bm25`, `exact` or `regex`. `scope` is a domain or folder; empty means all domains. |
-| `read` | Reads a full note, or one section and its subsections, with ids and versions. |
+| `read` | Reads a full note, or one section and its subsections, with ids and versions. If the store cannot find the heading or the note, the refusal gives `candidates`. |
 | `links` | Shows the links out of a note, into a note, or both, up to 3 hops. |
 | `log_query` | Filters log entries by time, `op` text, page or task id. `include_tool` adds the tool events. |
-| `patch_section` | Edits one section with a version check. `op` is `replace`, `append` or `prepend`. |
+| `patch_section` | Edits one section. `op` is `replace`, `append`, `prepend` or `replace_own_text`. All operations except `append` need a version check. |
 | `patch_header` | Edits the page header of a note with a version check. |
 | `create_note` | Creates a note in a domain that exists. It never overwrites. |
+| `create_domain` | Creates a domain with its description and its four start pages. Owner only. |
 | `move` | Renames a note in its domain and rewrites all links to it. It also promotes a working note. |
-| `status_item` | Adds or closes one status item. Owner only. |
-| `set_decision_status` | Changes the Status line of one decision record. Owner only. |
+| `status_item` | Adds, updates or closes one status item. `update` changes the text, and as an option the kind, of an open item. The event keeps the old text. Owner only. |
+| `set_decision_status` | Changes the Status line of one decision record. `void` needs a `reason`. Owner only. |
 | `log_append` | Appends one entry to the log of a domain. The pages that it names must exist. |
 | `preference` | Adds or retires a preference of the owner. `add` needs the words of the owner. Owner only. |
 | `source` | Adds a source, or cites or uncites a source from a note. |
 | `lease` | Takes or releases a lease on a section. |
 | `check` | Shows the problems of a domain. It changes nothing. |
+| `batch` | Does a list of writes in one transaction. See [Write two or more notes together](#write-two-or-more-notes-together). |
 
 ### How to edit a section
 
@@ -425,19 +402,51 @@ Each tool returns a JSON object. A result has `"ok": true`. A refusal has `"ok":
 
 The headings in `content` are relative to the section. A direct subsection starts with `#`. `replace` accepts the same format that `read` gives.
 
-To add a subsection, use `op: "append"`. `prepend` adds text before the own text of the section. It cannot add headings.
+This table gives the operations of `patch_section`:
 
-`heading` can be the heading text or a list with the full heading path. The path starts at the highest heading in the note text. An imported note usually has an H1, so its path starts with the H1, for example `["myproject status", "Blockers"]`. A note from `create_note` has its title outside the text, so its path starts with its first heading, for example `["Design", "Details"]`. If two sections have the same heading, the store gives the candidates. Then use `section_id`.
+| `op` | What it does | `if_version` |
+| --- | --- | --- |
+| `replace` | Replaces the section and its subsections with `content`. | Necessary |
+| `append` | Adds `content` after the last subsection. It can add subsections. | Not necessary. The store does not compare it. |
+| `prepend` | Adds `content` before the own text of the section. It cannot add headings. | Necessary |
+| `replace_own_text` | Replaces only the own text of the section: the text before its first subsection. The subsections do not change. It cannot add headings. | Necessary |
+
+If `replace`, `prepend` or `replace_own_text` has no `if_version`, the refusal is `version_required`.
+
+The text before the first heading of a note is a section too. To edit it, give `heading=[]` or its `section_id`. It cannot contain headings. There is one exception: if a note has only this section, `append` and `replace` on it can add headings. Then the note gets an outline.
+
+`heading` can be the heading text or a list with the full heading path. The path starts at the highest heading in the note text. An imported note usually has an H1, so its path starts with the H1, for example `["myproject status", "Blockers"]`. A note from `create_note` has its title outside the text, so its path starts with its first heading, for example `["Design", "Details"]`. If two sections have the same heading, the store gives the candidates. Then use `section_id`. If the store cannot find a heading, the refusal `not_found` gives a maximum of 5 `candidates`: the sections with the nearest headings. A heading without its date, such as `(2026-10-12)`, also finds the section. If the store cannot find a note, `candidates` gives the nearest note paths.
 
 The index catalog, the status items and the log entries are generated sections. `patch_section` refuses them. Use the `summary` field, `status_item` and `log_append`.
+
+### Write two or more notes together
+
+`batch` does a list of writes in one transaction. If one write is refused, the store rolls back all of them. Use it when two notes link to each other, or when one change goes across many notes.
+
+```text
+batch(ops=[
+  {"tool": "create_note", "args": {"path": "myproject/a", ...}},
+  {"tool": "create_note", "args": {"path": "myproject/b", ...}},
+  {"tool": "log_append", "args": {"domain": "myproject", "pages": ["myproject/a", "myproject/b"], ...}},
+])
+```
+
+- The tools are `create_note`, `patch_section`, `patch_header`, `status_item`, `set_decision_status`, `log_append` and `source`.
+- Each write has the same role rules and refusals as when you call its tool.
+- The store does the check one time, after the last write. Thus note A can link to note B before B exists in the list.
+- `log_append` writes go after the other writes. The pages that they name must exist at the end.
+- A refusal gives `op_index`, the position of the refused write in the list. A failed check at the end gives no `op_index`.
+- The result gives `results`, with the result of each write in the order of the list.
 
 ### Search modes
 
 | Mode | Use it for |
 | --- | --- |
-| `bm25` | Topics. A keyword search with a rank order. Lower scores are better. |
-| `exact` | Ids, hashes and paths. A substring search that ignores case. |
+| `bm25` | Topics. A keyword search with a rank order. Lower scores are better. A hit that has more of the words of the query gets a better score. If some hits have half of the words, with a minimum of 2, the store does not show the hits that have fewer. |
+| `exact` | Ids, hashes and paths. A search for full words that ignores case. `D51` finds `D51` but not `9ad51f0`. |
 | `regex` | Patterns. Each pattern must compile in Python. See [Differences between the backends](#differences-between-the-backends). |
+
+The snippets of `exact` and `regex` hits start and stop at the end of a word.
 
 ## Refusals
 
@@ -446,24 +455,30 @@ A refusal is an expected result. It is not an error of the server. The `error` f
 | `error` | Cause | What to do |
 | --- | --- | --- |
 | `version_conflict` | The section or note changed after you read it. | Merge into the `content` of the refusal. Try again with `current_version`. |
+| `version_required` | `replace`, `prepend` or `replace_own_text` has no `if_version`. | Read the section. Give its `version` as `if_version`. |
 | `check_failed` | The write adds a problem. `problems` lists it. | Correct the problem in your text. Try again. |
 | `leased` | Another agent has a lease on that part. | Wait until `expires_at`, or ask the holder to release it. |
 | `not_allowed` | A worker tried to write outside its working notes. | Write under `<domain>/working/<actor>/`. |
 | `owner_only` | A worker tried an owner action. | Ask the owner. |
-| `unknown_domain` | The domain is not in the store. | Use a domain from `domains`, or import the domain. |
-| `not_found`, `ambiguous_heading` | The store cannot find the note or section, or the heading is not unique. | Use a heading path or a `section_id`. |
+| `unknown_domain` | The domain is not in the store. | Use a domain from `domains`. To see the descriptions, call `list_domains`. Ask the owner before you create a domain. |
+| `not_found`, `ambiguous_heading` | The store cannot find the note or section, or the heading is not unique. | Use one of the `candidates`, a heading path or a `section_id`. |
+| `path_required` | `read` has no `path` and no `section_id`. | Give `path` for a full note, `path` and `heading` for one section, or `section_id`. |
+| `heading_required` | `patch_section` or `lease` has a `path` but no `heading`. | Give `heading`, or `section_id`. `heading=[]` is the text before the first heading. |
 | `summary_required`, `header_required` | A project note needs a summary and a full page header. | Give `summary`, `decision_status`, `impl_status` and `evidence`. |
 | `exists` | The note exists. `create_note` does not overwrite. | Use `patch_section`. |
 | `generated_section` | The store makes the section from rows. | Use `status_item`, `log_append` or the `summary` field. |
 | `status_line_changed`, `decision_overwritten`, `decision_removed` | The edit changes a decision record in a way that is not permitted. | Use `set_decision_status`, or append text only. |
 | `unknown_pages` | `log_append` names a page that is not in the store. | Name pages that exist. |
 | `bad_regex` | The pattern does not compile in Python. | Correct the pattern. |
-| `headings_not_allowed` | `prepend` text contains a heading. | Use `append` to add subsections. |
-| `bad_transition` | `set_decision_status` asks for a change that the life cycle does not permit, for example accepted to proposed. | Use proposed to accepted, rejected or superseded, or accepted to superseded. |
+| `headings_not_allowed` | `prepend` or `replace_own_text` text contains a heading, or a write puts a heading in the text before the first heading of a note that has other sections. | Use `append` to add subsections. |
+| `bad_transition` | `set_decision_status` asks for a change that the life cycle does not permit, for example accepted to proposed. | Use proposed to accepted, rejected or superseded, or accepted to superseded or void. |
+| `reason_required` | `set_decision_status` to `void` has no `reason`. | Give the reason why the acceptance was an error. |
+| `bad_batch`, `bad_args` | A `batch` write names a tool that `batch` does not accept, or its arguments do not agree with the tool. `op_index` shows the write. | Correct that write. |
 | `quote_required` | `preference` `add` has no words of the owner. | Give the quote of the owner. |
 | `promotion_needs_summary_and_header` | `move` of a working note into project knowledge has no summary or page header. | Give `summary` and the header fields. |
 | `bad_path` | The path is not permitted, for example a `move` of the index. | Use a path of a normal note. |
-| `domain_exists` | `apex-memory import` of a domain that is in the store. | Use a new database or another domain name. |
+| `domain_exists` | `create_domain` or `apex-memory import` of a domain that is in the store. | Use the domain that exists, or another domain name. |
+| `bad_name`, `description_required` | `create_domain` has a name that is not lowercase letters, digits and hyphens, or it has no description. | Correct the name. Give a description. |
 
 If the ops domain exists, the store records each refusal and each error in it. The record keeps the tool, the arguments and the result. The store replaces the `content` argument and long text with their length.
 

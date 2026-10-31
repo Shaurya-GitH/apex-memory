@@ -1,6 +1,6 @@
 [project]
 name = "apex-memory"
-version = "0.1.0"
+version = "0.2.0"
 description = "A knowledge store for AI agents, served over MCP: notes, sections, links, decisions, status and an append-only log."
 readme = "README.md"
 license = "MIT"
