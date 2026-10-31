@@ -4,12 +4,13 @@ Every write tool runs in one transaction: mutate -> guards -> check (any new pro
 event -> commit. Tools return plain dicts and raise Refused for expected failures (version conflict, failed check,
 guard). The database is reached only through a backend (apex_memory.backends); the SQL here is neutral.
 """
-import collections, contextlib, datetime, difflib, functools, inspect, json, re, threading, uuid
+import collections, contextlib, datetime, difflib, functools, inspect, json, re, threading, unicodedata, uuid
 
 from .backends import open_backend
 
 STALE_DAYS = 14        # a verify_live source older than this is flagged
 DUP_MIN = 200          # paragraphs at least this long count as a claim for the duplicate check
+COORD_POWER = 2        # bm25: score x (share of the query terms a hit holds) ** COORD_POWER; tuned on real searches
 
 FENCE = re.compile(r'^\s*(```|~~~)')
 HEADING = re.compile(r'^(#{1,6})[ \t]+(.*?)[ \t]*$')
@@ -556,8 +557,9 @@ class Store:
                 'truncated': len(index) > max_chars or len(status) > max_chars}
 
     def search(self, query: str, mode: str = 'bm25', scope: str = '', limit: int = 10) -> dict:
-        """Search note titles and summaries, sections and log entries. mode: 'bm25' (ranked keywords), 'exact'
-        (substring, e.g. ids and hashes) or 'regex' (Python syntax). scope: a domain or folder such as
+        """Search note titles and summaries, sections and log entries. mode: 'bm25' (ranked keywords; hits that hold
+        more of the query terms rank higher, and weak hits holding few of them drop out), 'exact' (whole words or
+        phrase, ignoring case, e.g. ids and hashes) or 'regex' (Python syntax). scope: a domain or folder such as
         'project/docs'; empty searches every domain. Hits carry path, section id, heading path, version and a snippet."""
         scope = scope.strip('/')
         domain = scope.split('/')[0] or None
@@ -566,13 +568,17 @@ class Store:
         log, log_args = ("t.op NOT LIKE 'tool:%' AND t.domain = ?", (domain,)) if domain else ("t.op NOT LIKE 'tool:%'", ())
         hits = []
         if mode == 'bm25':
+            texts = []
             for r in self.db.search('notes', query, inscope.format('path'), args):
                 hits.append({'kind': 'note', 'path': r['path'], 'version': r['version'], 'snippet': r['snippet'], 'score': r['score']})
+                texts.append(f"{r['title'] or ''} {r['summary'] or ''}")
             for r in self.db.search('sections', query, inscope.format('note'), args):
                 hits.append(self._hit(r, r['snippet'], r['score']))
+                texts.append(f"{r['heading'] or ''} {r['body']}")
             for r in self.db.search('events', query, log, log_args):
                 hits.append({'kind': 'event', 'event_id': r['id'], 'ts': local(r['ts']), 'op': r['op'], 'snippet': r['snippet'], 'score': r['score']})
-            hits.sort(key=lambda h: h['score'])
+                texts.append(f"{r['op']} {r['body'] or ''}")
+            hits = _coordinate(query, hits, texts)
         elif mode in ('exact', 'regex'):
             if mode == 'regex':
                 try:
@@ -580,9 +586,9 @@ class Store:
                 except re.error as e:
                     raise Refused('bad_regex', detail=str(e))
                 rows = self._q(f'SELECT t.* FROM sections t WHERE {self.db.regex("t.body")} AND {inscope.format("note")}', query, *args)
-            else:
-                rx = re.compile(re.escape(query), re.I)
-                rows = self.db.search('sections', query, inscope.format('note'), args, exact=True)
+            else:  # whole words: the text around the query is not a letter or digit where the query starts or ends with one
+                rx = re.compile(('(?<![^\\W_])' if query[:1].isalnum() else '') + re.escape(query) + ('(?![^\\W_])' if query[-1:].isalnum() else ''), re.I)
+                rows = [r for r in self.db.search('sections', query, inscope.format('note'), args, exact=True) if rx.search(r['body'])]
             for r in sorted(rows, key=lambda r: (r['note'], r['position'])):
                 hits.append(self._hit(r, _snip(r['body'], rx.search(r['body']))))
             for r in self._q(f'SELECT * FROM events t WHERE {log} ORDER BY id', *log_args):
@@ -1256,10 +1262,37 @@ def _strings(value):
     return [s for v in items for s in _strings(v)]
 
 
+def _words(text):
+    """Lower-case words without diacritics, split like the search index (letters and digits)."""
+    folded = ''.join(c for c in unicodedata.normalize('NFKD', text.lower()) if not unicodedata.combining(c))
+    return re.findall(r'[^\W_]+', folded)
+
+
+def _coordinate(query, hits, texts):
+    """bm25 hits ranked by score x (share of the query terms a hit holds) ** COORD_POWER. The relevance floor: a hit
+    must hold half the terms and at least two (all of a shorter query); when no hit does, every hit stays."""
+    terms = set(_words(query))
+    if not terms:
+        return sorted(hits, key=lambda h: h['score'])
+    need = min(len(terms), max(2, -(-len(terms) // 2)))
+    held = [len(terms & set(_words(x))) for x in texts]
+    for h, n in zip(hits, held):
+        h['score'] = h['score'] * (n / len(terms)) ** COORD_POWER
+    # ponytail: a strict floor (no fallback) lost top-3 hits in the real-search eval; it keeps every hit when none passes
+    return sorted([h for h, n in zip(hits, held) if n >= need] or hits, key=lambda h: h['score'])
+
+
 def _snip(text, m, width=80):
+    """About width characters around a match, starting and ending on word boundaries."""
     if not m:
         return ''
     a, b = max(0, m.start() - width), min(len(text), m.end() + width)
+    if a and not text[a - 1].isspace():
+        s = re.search(r'\s', text[a:m.start()])
+        a = a + s.end() if s else m.start()
+    if b < len(text) and not text[b].isspace():
+        s = [x.start() for x in re.finditer(r'\s', text[m.end():b])]
+        b = m.end() + s[-1] if s else m.end()
     return ('…' if a else '') + text[a:m.start()] + '[' + text[m.start():m.end()] + ']' + text[m.end():b] + ('…' if b < len(text) else '')
 
 

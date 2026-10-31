@@ -528,6 +528,32 @@ class MemoryTest(unittest.TestCase):
         self.assertEqual(self.events(), n + 6)  # every search is in the retrieval log
         self.refused('bad_regex', self.s.search, '(', mode='regex')
 
+    def test_bm25_prefers_hits_that_hold_more_query_terms(self):
+        # Real case (memory-ops IDEA 1052): weak one-word matches outranked real answers.
+        self.s.create_note('demo/weak', 'Weak', 'cache cache', '# Cache\n\nCache cache cache. Cache.\n', 'a', 'b', '2026-10-31 — t')
+        filler = ' '.join(f'word{i}' for i in range(120))
+        self.s.create_note('demo/strong', 'Strong', 'a long note', f'# Notes\n\n{filler} the tool cache invalidation rule. {filler}\n',
+                           'a', 'b', '2026-10-31 — t')
+        hits = self.s.search('tool cache invalidation', scope='demo')['hits']
+        self.assertEqual(hits[0]['path'], 'demo/strong')
+        self.assertNotIn('demo/weak', [h.get('path') for h in hits])  # below the floor: 1 of 3 terms
+        self.assertIn('demo/weak', [h.get('path') for h in self.s.search('cache zebra', scope='demo')['hits']])  # none passes: all stay
+
+    def test_exact_matches_whole_words_and_snippets_end_on_words(self):
+        # Real case: exact 'D51' matched inside commit hashes.
+        filler = ' '.join(f'alpha{i}' for i in range(40))
+        self.s.create_note('demo/ids', 'Ids', 'ids', f'# Ids\n\n{filler} decision D51 applies. {filler}\n', 'a', 'b', '2026-10-31 — t')
+        self.s.create_note('demo/hash', 'Hash', 'hash', '# Hash\n\nCommit 9ad51f0 and 3d51aa.\n', 'a', 'b', '2026-10-31 — t')
+        hits = self.s.search('d51', mode='exact', scope='demo')['hits']
+        self.assertEqual([h['path'] for h in hits], ['demo/ids'])
+        snip = hits[0]['snippet']
+        self.assertIn('[D51]', snip)
+        self.assertRegex(snip, r'^…alpha\d+ ')
+        self.assertRegex(snip, r' alpha\d+…$')
+        self.assertEqual([h['path'] for h in self.s.search('9ad51f0', mode='exact', scope='demo')['hits']], ['demo/hash'])
+        self.assertEqual(self.s.search('9ad51', mode='exact', scope='demo')['hits'], [])
+        self.assertEqual([h['path'] for h in self.s.search('decision D51 applies.', mode='exact', scope='demo')['hits']], ['demo/ids'])
+
     # ----- log -----
 
     def test_log_is_append_only_and_database_stamped(self):
