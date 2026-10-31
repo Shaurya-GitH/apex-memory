@@ -23,6 +23,7 @@ STATUS_KINDS = {'Current state': 'state', 'Unfinished / open': 'open', 'Blockers
 ACTOR = re.compile(r'^[a-z0-9][a-z0-9-]*$')
 SOURCE_KINDS = ('snapshot', 'live', 'transcript', 'web', 'owner')
 FIXED_PAGES = ('index', 'status', 'log', 'decisions')
+BATCH_TOOLS = ('create_note', 'patch_section', 'patch_header', 'status_item', 'set_decision_status', 'log_append', 'source')
 OPS_DOMAIN = 'memory-ops'   # default domain for the memory system's own feedback: failures and friction, logged by agents and automatically
 TRANSITIONS = {'proposed': {'accepted', 'rejected', 'superseded'}, 'accepted': {'superseded'}}
 
@@ -155,6 +156,7 @@ class Store:
         # One connection, shared by the MCP server's worker threads: one tool call at a time per process.
         # Processes are serialised by the backend's transaction (one writer).
         self._lock = threading.RLock()
+        self._tx = self._batch = False   # inside a write transaction; inside batch (checks run once, at its end)
         self.db = open_backend(url)
         self.location = self.db.location
         try:
@@ -171,8 +173,16 @@ class Store:
 
     @contextlib.contextmanager
     def _write(self):
-        with self._lock, self.db.transaction():
-            yield
+        with self._lock:
+            if self._tx:  # a write inside batch joins its transaction
+                yield
+                return
+            with self.db.transaction():
+                self._tx = True
+                try:
+                    yield
+                finally:
+                    self._tx = False
 
     def _q(self, sql, *args):
         return self.db.query(sql, args)
@@ -186,17 +196,25 @@ class Store:
         return self.db.insert('events', row | ({'ts': ts} if ts else {}))
 
     def _guarded(self, domain, op, task_id, mutate):
-        """One write transaction: mutate, refuse on any new check problem, log a tool event."""
+        """One write transaction: mutate, refuse on any new check problem, log a tool event. Inside batch the
+        checks run once, at the end of the batch."""
         with self._write():
             # ponytail: checks the whole domain before and after each write; scope to affected notes if domains grow large
             domains = [domain] if domain else sorted(self._domains())
-            before = {p for d in domains for p in self.problems(d)}
+            before = None if self._batch else self._check_state(domains)
             result, refs, body = mutate()
-            new = sorted({p for d in domains for p in self.problems(d)} - before)
-            if new:
-                raise Refused('check_failed', problems=new)
+            if before is not None:
+                self._refuse_new(before, domains)
             self._event(domain, 'tool:' + op, refs, body, task_id)
             return {'ok': True, **result}
+
+    def _check_state(self, domains):
+        return {p for d in domains for p in self.problems(d)}
+
+    def _refuse_new(self, before, domains):
+        new = sorted(self._check_state(domains) - before)
+        if new:
+            raise Refused('check_failed', problems=new)
 
     def _catalog_generated(self, domain):
         return bool(self._one("SELECT 1 FROM sections WHERE note = ? AND generated = 'catalog'", f'{domain}/index'))
@@ -1038,6 +1056,41 @@ class Store:
 
         return self._guarded(t['note'].split('/')[0], 'lease', task_id, mutate)
 
+    def batch(self, ops: list[dict], task_id: str | None = None) -> dict:
+        """Several writes in one transaction, all or nothing: ops = [{"tool": name, "args": {...}}, ...] with tools
+        create_note, patch_section, patch_header, status_item, set_decision_status, log_append and source. Each op
+        has its own role rules and refusals. The checks (and the pages that log_append names) run once, against the
+        final state, so notes that link to each other can be created together. A refusal rolls back every op and
+        gives op_index. Returns the result of each op."""
+        if not isinstance(ops, list) or not ops:
+            raise Refused('bad_batch', hint='ops is a non-empty list of {"tool": name, "args": {...}}', tools=list(BATCH_TOOLS))
+        for i, o in enumerate(ops):
+            if not isinstance(o, dict) or o.get('tool') not in BATCH_TOOLS or not isinstance(o.get('args', {}), dict):
+                raise Refused('bad_batch', op_index=i, tools=list(BATCH_TOOLS))
+        # log entries go last: the pages they name are checked against the final state
+        order = [i for i, o in enumerate(ops) if o['tool'] != 'log_append'] + [i for i, o in enumerate(ops) if o['tool'] == 'log_append']
+        results = [None] * len(ops)
+        with self._write():
+            # ponytail: checks every domain before and after; scope to the domains the ops touch if stores grow large
+            before = self._check_state(sorted(self._domains()))
+            self._batch = True
+            try:
+                for i in order:
+                    fn, args = _RAW[ops[i]['tool']], {'task_id': task_id, **ops[i].get('args', {})}
+                    try:
+                        inspect.signature(fn).bind(self, **args)
+                    except TypeError as e:
+                        raise Refused('bad_args', op_index=i, tool=ops[i]['tool'], detail=str(e))
+                    try:
+                        results[i] = fn(self, **args)
+                    except Refused as e:
+                        raise Refused(e.info['error'], op_index=i, tool=ops[i]['tool'],
+                                      **{k: v for k, v in e.info.items() if k not in ('ok', 'error')}) from None
+            finally:
+                self._batch = False
+            self._refuse_new(before, sorted(self._domains()))
+        return {'ok': True, 'results': results}
+
     def log_append(self, domain: str, op: str, pages: list[str], source: str, outcome: str, task_id: str | None = None) -> dict:
         """Append a narrative log entry. The database stamps the time; pages must exist in the store."""
         self._need_domain(domain)
@@ -1089,7 +1142,8 @@ def _snip(text, m, width=80):
 
 
 TOOLS = ['brief', 'search', 'read', 'links', 'log_query', 'patch_section', 'patch_header', 'create_note', 'move', 'status_item',
-         'set_decision_status', 'log_append', 'preference', 'source', 'lease', 'check']
+         'set_decision_status', 'log_append', 'preference', 'source', 'lease', 'check', 'batch']
+_RAW = {name: getattr(Store, name) for name in BATCH_TOOLS}  # unwrapped: inside batch, only the batch records a refusal
 
 
 def _locked(fn, capture):

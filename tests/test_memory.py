@@ -296,6 +296,39 @@ class MemoryTest(unittest.TestCase):
         e = self.s._one("SELECT * FROM events WHERE op = 'tool:patch_section'")
         self.assertEqual((json.loads(e['body'])['before'], e['actor'], e['task_id'], e['run_id']), (r['content'], 'test', 'T1', self.s.run_id))
 
+    # ----- batch -----
+
+    def test_batch_writes_cross_linked_pages(self):
+        # Real case (memory-ops events 914-917): two notes that link to each other, and a log entry naming both.
+        hdr = {'decision_status': 'proposal', 'impl_status': 'none', 'evidence': '2026-10-23 — test'}
+        ops = [{'tool': 'create_note', 'args': {'path': 'demo/a', 'title': 'A', 'summary': 'note a', 'body': '# A\n\nSee [[demo/b#Details B]].\n', **hdr}},
+               {'tool': 'log_append', 'args': {'domain': 'demo', 'op': 'LINK A AND B', 'pages': ['demo/a', 'demo/b'], 'source': 's', 'outcome': 'o'}},
+               {'tool': 'create_note', 'args': {'path': 'demo/b', 'title': 'B', 'summary': 'note b', 'body': '# B\n\n## Details B\n\nBack to [[demo/a]].\n', **hdr}}]
+        self.refused('check_failed', self.s.create_note, **ops[0]['args'])
+        self.refused('unknown_pages', self.s.log_append, **ops[1]['args'])
+        out = self.s.batch(ops, task_id='T7')
+        self.assertEqual([r['ok'] for r in out['results']], [True, True, True])
+        self.assertEqual(out['results'][2]['path'], 'demo/b')
+        self.assertEqual(self.s.check('demo')['problems'], ["decision P02 needs exactly one '- **Status:**' line (has 0)"])
+        self.assertEqual([e['op'] for e in self.s.log_query('demo', task_id='T7')['entries']], ['LINK A AND B'])
+        self.assertEqual(len(self.s.log_query('demo', task_id='T7', include_tool=True)['entries']), 3)
+
+    def test_batch_is_all_or_nothing(self):
+        before = self.snapshot(self.s)
+        r = self.s.read('demo/topic', heading='Rules')
+        good = {'tool': 'create_note', 'args': {'path': 'demo/c', 'title': 'C', 'summary': 'c', 'body': '# C\n', 'decision_status': 'a',
+                                               'impl_status': 'b', 'evidence': '2026-10-23 — t'}}
+        info = self.refused('version_conflict', self.s.batch, [good, {'tool': 'patch_section', 'args': {
+            'op': 'replace', 'content': 'x', 'if_version': r['version'] + 9, 'section_id': r['section_id']}}])
+        self.assertEqual((info['op_index'], info['tool']), (1, 'patch_section'))
+        info = self.refused('check_failed', self.s.batch, [good, {'tool': 'patch_section', 'args': {
+            'op': 'append', 'content': 'See [[demo/nowhere]].', 'section_id': r['section_id']}}])
+        self.assertIn('broken link [[demo/nowhere]]', info['problems'][0])
+        self.assertEqual(self.refused('bad_batch', self.s.batch, [good, {'tool': 'move', 'args': {}}])['op_index'], 1)
+        self.assertEqual(self.refused('bad_args', self.s.batch, [{'tool': 'log_append', 'args': {'x': 1}}])['op_index'], 0)
+        self.assertEqual(self.refused('not_allowed', self.worker().batch, [good])['op_index'], 0)  # role rules per op
+        self.assertEqual(self.snapshot(self.s), before)
+
     # ----- search -----
 
     def test_search_modes(self):
