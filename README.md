@@ -737,7 +737,7 @@ The store compiles each `regex` pattern in Python first. Then it sends the patte
    uv run python -m unittest
    ```
 
-   The Postgres tests are skipped. The result is `OK (skipped=47)`.
+   The Postgres tests are skipped. The result is `OK (skipped=83)`.
 
 3. To run the tests on Postgres too, install the extra:
 
