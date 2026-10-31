@@ -16,7 +16,7 @@ HEADING = re.compile(r'^(#{1,6})[ \t]+(.*?)[ \t]*$')
 LINK = re.compile(r'!?\[\[([^\]|#]*)(#[^\]|]*)?(?:\|[^\]]*)?\]\]')
 HEADER = re.compile(r'^> \*\*Decision status:\*\* (.*?) \*\*Implementation status:\*\* (.*?) \*\*Evidence checked:\*\* (.*)$')
 RECORD = re.compile(r'^([DP]\d+) — (.*)$')
-STATUS_LINE = re.compile(r'^- \*\*Status:\*\* (accepted|proposed|rejected|superseded by ([DP]\d+))[ \t]*$', re.M)
+STATUS_LINE = re.compile(r'^- \*\*Status:\*\* (accepted|proposed|rejected|void|superseded by ([DP]\d+))[ \t]*$', re.M)
 DATE = re.compile(r'\d{4}-\d{2}-\d{2}')
 CATALOG_ROW = re.compile(r'^\| \[\[([^\]|#]+)\]\] \| (.*) \|$')
 STATUS_KINDS = {'Current state': 'state', 'Unfinished / open': 'open', 'Blockers': 'blocker', 'Next concrete action': 'next'}
@@ -25,7 +25,8 @@ SOURCE_KINDS = ('snapshot', 'live', 'transcript', 'web', 'owner')
 FIXED_PAGES = ('index', 'status', 'log', 'decisions')
 BATCH_TOOLS = ('create_note', 'patch_section', 'patch_header', 'status_item', 'set_decision_status', 'log_append', 'source')
 OPS_DOMAIN = 'memory-ops'   # default domain for the memory system's own feedback: failures and friction, logged by agents and automatically
-TRANSITIONS = {'proposed': {'accepted', 'rejected', 'superseded'}, 'accepted': {'superseded'}}
+TRANSITIONS = {'proposed': {'accepted', 'rejected', 'superseded'}, 'accepted': {'superseded', 'void'}}
+PATCH_OPS = ['replace', 'append', 'prepend', 'replace_own_text']
 
 
 class Refused(Exception):
@@ -375,7 +376,7 @@ class Store:
         domain = s['note'].split('/')[0]
         if g == 'catalog':
             rows = self._q("SELECT path, summary FROM notes WHERE domain = ? AND summary IS NOT NULL AND path NOT LIKE domain || '/working/%' "
-                           'ORDER BY coalesce(catalog_position, 0), path', domain)
+                           "AND path != domain || '/index' ORDER BY coalesce(catalog_position, 0), path", domain)
             return body + ''.join(f"| [[{r['path']}]] | {r['summary']} |\n" for r in rows) + '\n'
         if g.startswith('status:'):
             items = self._q('SELECT text FROM status_items WHERE domain = ? AND kind = ? AND closed_at IS NULL '
@@ -465,6 +466,8 @@ class Store:
         for r in self._q("SELECT path FROM notes WHERE domain = ? AND summary IS NULL AND path != ? AND path NOT LIKE domain || '/working/%'"
                          + linked, domain, f'{domain}/index', *([f'{domain}/index'] if linked else [])):
             p.append(f"{r['path']} has no summary (missing from the index)")
+        if self._one("SELECT 1 FROM notes WHERE path = ? AND (summary IS NULL OR trim(summary) = '')", f'{domain}/index'):
+            p.append(f'{domain}/index has no summary: the domain description that list_domains shows')
         claims = collections.defaultdict(set)
         for s in self._q('SELECT s.note, s.body FROM sections s JOIN notes n ON n.path = s.note '
                          "WHERE n.domain = ? AND s.generated IS NULL AND n.path NOT LIKE n.domain || '/working/%' AND n.path != n.domain || '/log'",
@@ -496,9 +499,10 @@ class Store:
     # ---------- tools ----------
 
     def check(self, domain: str) -> dict:
-        """Read-only check of a domain: broken links and anchors, notes missing from the index, the same paragraph
-        claimed in two notes, decision records without exactly one Status line, stale live sources. The same check
-        runs inside every write and rolls the write back if it adds a problem."""
+        """Read-only check of a domain: broken links and anchors, notes missing from the index, an index without
+        its summary (the domain description), the same paragraph claimed in two notes, decision records without
+        exactly one Status line, stale live sources. The same check runs inside every write and rolls the write back
+        if it adds a problem."""
         self._need_domain(domain)
         p = self.problems(domain)
         return {'ok': True, 'domain': domain, 'problems': p}
@@ -518,7 +522,7 @@ class Store:
         mine = self._q('SELECT path FROM notes WHERE path LIKE ? ORDER BY path', f'{domain}/working/{self.actor}/%')
         if not self._catalog_generated(domain):  # index kept as written: show notes it does not mention
             extra = self._q("SELECT path, summary FROM notes n WHERE domain = ? AND summary IS NOT NULL AND path NOT LIKE domain || '/working/%' "
-                            'AND NOT EXISTS (SELECT 1 FROM links l JOIN sections s ON s.id = l.src_section WHERE s.note = ? AND l.dst = n.path) '
+                            "AND path != domain || '/index' AND NOT EXISTS (SELECT 1 FROM links l JOIN sections s ON s.id = l.src_section WHERE s.note = ? AND l.dst = n.path) "
                             'ORDER BY coalesce(catalog_position, 0), path', domain, f'{domain}/index')
             if extra:
                 index += '\n\n===== notes not mentioned on the index page\n' + '\n'.join(f"- [[{r['path']}]] {r['summary']}" for r in extra)
@@ -622,11 +626,13 @@ class Store:
     def patch_section(self, op: str, content: str, if_version: int | None = None, section_id: int | None = None, path: str | None = None,
                       heading: list[str] | str | None = None, summary: str | None = None, task_id: str | None = None) -> dict:
         """Edit one section. op: 'replace' (content = what read returned for the section, subsections included,
-        headings relative), 'append' (after the subtree; may add subsections) or 'prepend' (before the own text; no
-        headings). replace and prepend need if_version (the section version read returned); append needs none.
-        Optional summary updates the note's index line. All or nothing, with the checks inside."""
-        if op not in ('replace', 'append', 'prepend'):
-            raise Refused('bad_op', op=op, ops=['replace', 'append', 'prepend'])
+        headings relative), 'append' (after the subtree; may add subsections), 'prepend' (before the own text; no
+        headings) or 'replace_own_text' (only the text before the first subsection; subsections kept; no headings).
+        All but append need if_version (the section version read returned). On a page whose only section is the
+        root, append and replace on the root can add headings. Optional summary updates the note's index line (on
+        <domain>/index: the domain description). All or nothing, with the checks inside."""
+        if op not in PATCH_OPS:
+            raise Refused('bad_op', op=op, ops=PATCH_OPS)
         if if_version is None and op != 'append':
             raise Refused('version_required', op=op, hint='give if_version: the section version that read returned')
         t0 = self._target(section_id, path, heading)
@@ -639,7 +645,7 @@ class Store:
             self._check_leases([r['id'] for r in rows + self._ancestors(t)])
             if op != 'append' and t['version'] != if_version:  # appending at the end does not depend on what is there
                 raise Refused('version_conflict', section_id=t['id'], current_version=t['version'], content=self._subtree_text(t, rows))
-            if any(r['generated'] for r in rows):
+            if any(r['generated'] for r in (rows[:1] if op == 'replace_own_text' else rows)):
                 raise Refused('generated_section', section_id=t['id'],
                               hint='index catalog, status and log are rendered from rows: use create_note/summary, status_item, log_append')
             current = self._subtree_text(t, rows)
@@ -649,8 +655,11 @@ class Store:
                 new = current.rstrip('\n') + '\n\n' + content.strip('\n') + '\n\n'
             else:
                 if has_heading(content):
-                    raise Refused('headings_not_allowed', hint='prepend adds text before the own text; use append for subsections')
-                new = '\n' + content.strip('\n') + '\n\n' + current.lstrip('\n')
+                    raise Refused('headings_not_allowed', hint=f'{op} changes only the own text; use append for subsections')
+                if op == 'prepend':
+                    new = '\n' + content.strip('\n') + '\n\n' + current.lstrip('\n')
+                else:
+                    new = ('\n' + content.strip('\n') + '\n\n' if content.strip() else '\n') + current[len(t['body']):]
             records = {r['id']: r for r in self._records(domain)} if t['note'] == f'{domain}/decisions' else None
             changed = self._apply_subtree(t, rows, new)
             if summary is not None:
@@ -798,8 +807,9 @@ class Store:
 
     def status_item(self, domain: str, action: str, kind: str | None = None, text: str | None = None,
                     refs: list[str] | None = None, item_id: int | None = None, task_id: str | None = None) -> dict:
-        """Add one status item (action='add', kind: state|open|blocker|next, text) or close one (action='close',
-        item_id). The status page and brief render from these items. Owner only."""
+        """Add one status item (action='add', kind: state|open|blocker|next, text), change the text (and optionally
+        the kind) of an open one (action='update', item_id, text) or close one (action='close', item_id). The status
+        page and brief render from these items; the event keeps the old text. Owner only."""
         self._need_domain(domain)
         self._need_owner('status_item')
 
@@ -817,14 +827,28 @@ class Store:
                     raise Refused('not_open', item_id=item_id)
                 self.db.execute('UPDATE status_items SET closed_at = ? WHERE id = ?', (today(), item_id))
                 return {'item_id': item_id}, {'item': item_id}, json.dumps({'action': 'close', 'text': it['text']}, ensure_ascii=False)
-            raise Refused('bad_action', actions=['add', 'close'])
+            if action == 'update':
+                it = self._one('SELECT * FROM status_items WHERE id = ? AND domain = ? AND closed_at IS NULL', item_id, domain)
+                if not it:
+                    raise Refused('not_open', item_id=item_id)
+                new_kind = kind or it['kind']
+                if new_kind not in STATUS_KINDS.values() or not (text or '').strip():
+                    raise Refused('bad_item', kinds=list(STATUS_KINDS.values()), hint='update needs an open item_id and text; kind is optional')
+                pos = it['position'] if new_kind == it['kind'] else self._one(
+                    'SELECT coalesce(max(position), 0) + 1 FROM status_items WHERE domain = ? AND kind = ?', domain, new_kind)[0]
+                self.db.execute('UPDATE status_items SET text = ?, kind = ?, position = ?, updated_at = ? WHERE id = ?',
+                                (text.strip(), new_kind, pos, today(), item_id))
+                return {'item_id': item_id}, {'item': item_id}, json.dumps(
+                    {'action': 'update', 'kind': new_kind, 'text': text.strip(), 'old_kind': it['kind'], 'old_text': it['text']}, ensure_ascii=False)
+            raise Refused('bad_action', actions=['add', 'update', 'close'])
 
         return self._guarded(domain, 'status_item', task_id, mutate)
 
-    def set_decision_status(self, domain: str, id: str, status: str, superseded_by: str | None = None,
+    def set_decision_status(self, domain: str, id: str, status: str, superseded_by: str | None = None, reason: str | None = None,
                             task_id: str | None = None) -> dict:
         """Move a decision record through its life cycle by rewriting its one Status line: proposed -> accepted,
-        rejected or superseded; accepted -> superseded (superseded_by must be an accepted decision). Owner only."""
+        rejected or superseded; accepted -> superseded (superseded_by must be an accepted decision) or void (an
+        acceptance made in error; needs reason, which is added to the record as a Void reason line). Owner only."""
         self._need_domain(domain)
         self._need_owner('set_decision_status')
 
@@ -835,22 +859,26 @@ class Store:
             cur = rec['status'][0][0].split()[0]
             if status not in TRANSITIONS.get(cur, set()):
                 raise Refused('bad_transition', id=id, current=cur, allowed=sorted(TRANSITIONS.get(cur, set())))
-            line = status
+            line = new = status
+            if status == 'void':
+                if not (reason or '').strip():
+                    raise Refused('reason_required', hint='void needs reason: why the acceptance was an error')
+                new = f"void\n- **Void reason:** {' '.join(reason.split())} ({today()})"
             if status == 'superseded':
                 by = self._one("SELECT 1 FROM decisions WHERE domain = ? AND id = ? AND status = 'accepted'", domain, superseded_by)
                 if not by or superseded_by == id:
                     raise Refused('superseded_by_required', hint='superseded_by must name another accepted decision')
-                line = f'superseded by {superseded_by}'
+                line = new = f'superseded by {superseded_by}'
             s = rec['section']
             self._check_leases([r['id'] for r in self._subtree(s) + self._ancestors(s)])
-            body = STATUS_LINE.sub(f'- **Status:** {line}', s['body'], count=1)
+            body = STATUS_LINE.sub(lambda m: f'- **Status:** {new}', s['body'], count=1)
             self.db.execute('UPDATE sections SET body = ?, version = version + 1 WHERE id = ?', (body, s['id']))
             for a in self._ancestors(s):
                 self.db.execute('UPDATE sections SET version = version + 1 WHERE id = ?', (a['id'],))
             self._touch(s['note'])
             self._derive_decisions(domain)
             return ({'id': id, 'status': status, 'superseded_by': superseded_by, 'section_id': s['id']},
-                    {'decision': id, 'section': s['id']}, json.dumps({'from': rec['status'][0][0], 'to': line}))
+                    {'decision': id, 'section': s['id']}, json.dumps({'from': rec['status'][0][0], 'to': line, 'reason': reason}, ensure_ascii=False))
 
         return self._guarded(domain, 'set_decision_status', task_id, mutate)
 
@@ -1065,6 +1093,65 @@ class Store:
 
         return self._guarded(t['note'].split('/')[0], 'lease', task_id, mutate)
 
+    def create_domain(self, domain: str, title: str, description: str, task_id: str | None = None) -> dict:
+        """Create a new domain with its start pages: index (with the catalog), status, log and decisions. description
+        is the domain's line in list_domains: what it holds and when to choose it (e.g. "not for X; use Y"); it is
+        kept as the index summary. domain: lowercase letters, digits and hyphens. Owner only."""
+        self._need_owner('create_domain')
+        if not ACTOR.match(domain or ''):
+            raise Refused('bad_name', domain=domain, hint='lowercase letters, digits and hyphens, e.g. my-product')
+        if not (description or '').strip():
+            raise Refused('description_required', hint='say what the domain holds and when to choose it')
+        title = (title or '').strip() or domain
+        CATALOG = {'decisions': 1, 'status': 2, 'log': 3}  # catalog order of the start pages
+        pages = {  # path: (title, summary, [(heading, level, generated, body)])
+            'index': (f'{title} index', description.strip(), [(f'{title} index', 1, None, '\n'),
+                                                              ('Catalog', 2, 'catalog', '\n| Page | Purpose |\n|---|---|\n')]),
+            'status': (f'{title} status', 'Current state', [(f'{title} status', 1, None, '\n')] + [
+                (h, 2, f'status:{k}', '') for h, k in STATUS_KINDS.items()]),
+            'log': (f'{title} log', 'Append-only activity', [(f'{title} log', 1, 'log', '\n')]),
+            'decisions': (f'{title} decisions', 'Decision records', [(f'{title} decisions', 1, None, '\n')]),
+        }
+
+        def mutate():
+            if domain in self._domains():
+                raise Refused('domain_exists', domain=domain)
+            for name, (page_title, summary, secs) in pages.items():
+                path = f'{domain}/{name}'
+                self.db.execute('INSERT INTO notes (path, domain, title, status, meta, summary, catalog_position, updated_at) '
+                                'VALUES (?, ?, ?, ?, ?, ?, ?, ?)', (path, domain, page_title, 'current', json.dumps(
+                                    {'_keys': ['title', 'status', 'updated', 'tags'], 'tags': [domain]}), summary, CATALOG.get(name), today()))
+                stack = []
+                parsed = []
+                for heading, level, _, body in secs:
+                    stack = [h for h in stack if h[0] < level] + [(level, heading)]
+                    parsed.append({'heading': heading, 'level': level, 'path': [h for _, h in stack], 'body': body})
+                self._insert_sections(path, '', parsed, {i: (g, s[3]) for i, s in enumerate(secs) if (g := s[2])})
+            paths = [f'{domain}/{p}' for p in pages]
+            return {'domain': domain, 'pages': paths}, {'domain': domain, 'pages': paths}, json.dumps({'title': title}, ensure_ascii=False)
+
+        return self._guarded(domain, 'create_domain', task_id, mutate)
+
+    def list_domains(self) -> dict:
+        """Every domain: its description (what it holds and when to choose it), note count, last log activity, and
+        ops: true for the domain that records the memory system's own failures. Choose domains by description, then
+        call brief. description_missing: true means the index has no summary; the first paragraph of the index stands
+        in for it."""
+        out = []
+        for d in sorted(self._domains()):
+            n = self._one('SELECT summary FROM notes WHERE path = ?', f'{d}/index')
+            row = {'domain': d, 'description': (n and n['summary'] or '').strip()}
+            if not row['description']:
+                text = self.render_note(f'{d}/index', frontmatter=False) if n else ''
+                para = next((p for p in re.split(r'\n[ \t]*\n', text) if p.strip() and not re.match(r'\s*(#|\||> \*\*Decision status)', p)), '')
+                para = ' '.join(para.split())
+                row.update(description=para if len(para) <= 400 else para[:400].rsplit(' ', 1)[0] + ' …', description_missing=True)
+            last = self._one("SELECT max(ts) FROM events WHERE domain = ? AND op NOT LIKE 'tool:%'", d)[0]
+            row.update(notes=self._one('SELECT count(*) FROM notes WHERE domain = ?', d)[0], last_log=last and local(last),
+                       ops=d == self.ops_domain)
+            out.append(row)
+        return {'ok': True, 'domains': out}
+
     def batch(self, ops: list[dict], task_id: str | None = None) -> dict:
         """Several writes in one transaction, all or nothing: ops = [{"tool": name, "args": {...}}, ...] with tools
         create_note, patch_section, patch_header, status_item, set_decision_status, log_append and source. Each op
@@ -1151,7 +1238,7 @@ def _snip(text, m, width=80):
 
 
 TOOLS = ['brief', 'search', 'read', 'links', 'log_query', 'patch_section', 'patch_header', 'create_note', 'move', 'status_item',
-         'set_decision_status', 'log_append', 'preference', 'source', 'lease', 'check', 'batch']
+         'set_decision_status', 'log_append', 'preference', 'source', 'lease', 'check', 'batch', 'create_domain', 'list_domains']
 _RAW = {name: getattr(Store, name) for name in BATCH_TOOLS}  # unwrapped: inside batch, only the batch records a refusal
 
 

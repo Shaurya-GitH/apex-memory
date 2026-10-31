@@ -15,8 +15,10 @@ from .store import OPS_DOMAIN, TOOLS, Refused, Store
 
 def build(store):
     server = MCPServer('apex-memory', instructions=(
+        'Call list_domains, choose the domains whose description matches the task, then brief(domain); '
+        'if none matches, ask the owner before create_domain. '
         f'Memory store {store.store_id} at {store.location} (actor {store.actor}, role {store.role}). '
-        'Start with brief(domain); search, then read one section; edit with patch_section using the version read returned '
+        'Search, then read one section; edit with patch_section using the version read returned '
         '(replace accepts exactly what read returned). Writes are all-or-nothing and run the checks; a refusal says why. '
         'Log meaningful work with log_append; status changes with status_item; decision status only with set_decision_status. '
         f'Scratch notes go under <domain>/working/{store.actor}/ (a worker writes only there); record the owner\'s preferences '

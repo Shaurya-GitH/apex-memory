@@ -205,6 +205,10 @@ class MemoryTest(unittest.TestCase):
         """A URL for a new, empty store on the backend under test."""
         return str(self.dir / f'{name}-{uuid.uuid4().hex[:8]}.db')
 
+    @staticmethod
+    def no_desc(domain):
+        return f'{domain}/index has no summary: the domain description that list_domains shows'
+
     def refused(self, error, fn, *args, **kw):
         with self.assertRaises(Refused) as cm:
             fn(*args, **kw)
@@ -304,17 +308,17 @@ class MemoryTest(unittest.TestCase):
         # Real case (memory-ops event 291): de-duplicating a paragraph pasted into 10 pages was refused step by step.
         self.import_extra('dup', {'index.md': '# Dup\n\n## Catalog\n\n| [[dup/a]] | a |\n| [[dup/b]] | b |\n| [[dup/c]] | c |\n| [[dup/d]] | d |\n',
                                   **{f'{n}.md': f'# {n.upper()}\n\n{self.PARA}\n' for n in 'abc'}, 'd.md': '# D\n\nOther text.\n'})
-        self.assertEqual(len(self.s.check('dup')['problems']), 1)
+        self.assertEqual(len(self.s.check('dup')['problems']), 2)  # the paragraph, and the index without a description
         a = self.s.read('dup/a', heading='A')
         self.assertTrue(self.s.patch_section('replace', '\nSee [[dup/c]].\n', a['version'], section_id=a['section_id'])['ok'])
-        self.assertIn('same paragraph in dup/b, dup/c:', self.s.check('dup')['problems'][0])
+        self.assertIn('same paragraph in dup/b, dup/c:', self.s.check('dup')['problems'][1])
         d = self.s.read('dup/d', heading='D')
         self.refused('check_failed', self.s.patch_section, 'append', self.PARA, section_id=d['section_id'])  # one more copy
         self.assertTrue(self.s.patch_section('append', self.PARA.replace('long', 'very long'), section_id=a['section_id'])['ok'])  # one copy
         self.refused('check_failed', self.s.patch_section, 'append', self.PARA.replace('long', 'very long'), section_id=d['section_id'])  # a new duplicate
         b = self.s.read('dup/b', heading='B')
         self.assertTrue(self.s.patch_section('replace', '\nSee [[dup/c]].\n', b['version'], section_id=b['section_id'])['ok'])
-        self.assertEqual(self.s.check('dup')['problems'], [])
+        self.assertEqual(self.s.check('dup')['problems'], [self.no_desc('dup')])
 
     def test_root_only_page_gets_headings(self):
         # Real case (memory-ops events 984-995): a page whose only section is the root could not get any heading.
@@ -332,6 +336,125 @@ class MemoryTest(unittest.TestCase):
         self.s.patch_section('replace', '\nNew text.\n\n# Part\n\nBody.\n', root2['version'], section_id=root2['section_id'])
         self.assertEqual([o['heading_path'] for o in self.s.read('demo/flat2')['outline']], [[], ['Part']])
 
+    # ----- new tools -----
+
+    def test_replace_own_text_keeps_subsections(self):
+        # Real case (memory-ops event 160): one sentence in a 30k-char index intro needed the whole subtree resent.
+        r = self.s.read('demo/topic', heading='Topic')
+        ids = [o['section_id'] for o in r['outline']]
+        self.refused('version_required', self.s.patch_section, 'replace_own_text', 'x', section_id=r['section_id'])
+        self.refused('headings_not_allowed', self.s.patch_section, 'replace_own_text', 'x\n\n# Sub', r['version'], section_id=r['section_id'])
+        self.refused('check_failed', self.s.patch_section, 'replace_own_text', 'See [[demo/nowhere]].', r['version'], section_id=r['section_id'])
+        out = self.s.patch_section('replace_own_text', 'New intro, still linking [[demo/sub/deep]].', r['version'], section_id=r['section_id'])
+        r2 = self.s.read('demo/topic', heading='Topic')
+        self.assertEqual([o['section_id'] for o in r2['outline']], ids)
+        self.assertEqual(r2['content'], r['content'].replace(r['content'][:r['content'].index('# Rules')], '\nNew intro, still linking [[demo/sub/deep]].\n\n'))
+        self.assertEqual(out['version'], r2['version'])
+        d01 = self.s.read('demo/decisions', heading='D01 — Use SQLite (2026-10-01)')
+        self.refused('decision_overwritten', self.s.patch_section, 'replace_own_text', '- **Status:** accepted\n- **Decision:** Postgres.',
+                     d01['version'], section_id=d01['section_id'])
+        idx = self.s.read('demo/index', heading='Demo knowledge index')  # its subtree holds the generated catalog
+        self.assertTrue(self.s.patch_section('replace_own_text', 'The demo domain.', idx['version'], section_id=idx['section_id'])['ok'])
+
+    def test_create_domain_and_list_domains(self):
+        # Real cases: no tool created a domain (event 511); an agent could not find a domain (event 296, brief('__list__')).
+        w = self.worker()
+        self.refused('owner_only', w.create_domain, 'newdom', 'New domain', 'Holds X.')
+        self.refused('bad_name', self.s.create_domain, 'New Dom', 'New domain', 'Holds X.')
+        self.refused('description_required', self.s.create_domain, 'newdom', 'New domain', ' ')
+        self.refused('domain_exists', self.s.create_domain, 'demo', 'Demo', 'Holds demo.')
+        out = self.s.create_domain('newdom', 'New domain', 'The new product: its plans and contracts. Not for the demo; use demo.')
+        self.assertEqual(out['pages'], ['newdom/index', 'newdom/status', 'newdom/log', 'newdom/decisions'])
+        self.assertEqual(self.s.check('newdom')['problems'], [])
+        self.assertEqual([l for l in self.s.render_note('newdom/index').splitlines() if l.startswith('| [[')],
+                         ['| [[newdom/decisions]] | Decision records |', '| [[newdom/status]] | Current state |', '| [[newdom/log]] | Append-only activity |'])
+        self.s.create_note('newdom/plan', 'Plan', 'the plan', '# Plan\n', 'a', 'b', '2026-10-31 — t')
+        self.s.status_item('newdom', 'add', kind='next', text='Write the plan')
+        self.s.log_append('newdom', 'START', ['newdom/plan'], 's', 'o')
+        self.s.patch_section('append', '# D01 — Start (2026-10-31)\n- **Status:** accepted', path='newdom/decisions', heading='New domain decisions')
+        b = self.s.brief('newdom')['brief']
+        for text in ('accepted: D01', 'Write the plan', '— START', '| [[newdom/plan]] | the plan |'):
+            self.assertIn(text, b)
+        self.s.create_domain('memory-ops', 'Memory ops', 'Failures and friction of the memory system itself.')
+        self.refused('not_found', self.s.read, 'demo/nowhere')
+        self.assertEqual(self.s._one("SELECT count(*) FROM events WHERE domain = 'memory-ops' AND op = 'tool:refused'")[0], 1)
+        doms = {d['domain']: d for d in w.list_domains()['domains']}
+        self.assertEqual(sorted(doms), ['demo', 'memory-ops', 'newdom'])
+        self.assertEqual(doms['newdom']['description'], 'The new product: its plans and contracts. Not for the demo; use demo.')
+        self.assertEqual((doms['newdom']['notes'], doms['newdom']['ops'], doms['memory-ops']['ops']), (5, False, True))
+        self.assertEqual(doms['newdom']['last_log'][:10], datetime.date.today().isoformat())
+        self.assertNotIn('description_missing', doms['newdom'])
+        demo = doms['demo']  # imported: no description yet, so the first paragraph of the index stands in
+        self.assertEqual((demo['description'], demo['description_missing'], demo['notes']), ('Primary knowledge base for the demo.', True, 7))
+        self.assertEqual(demo['last_log'], local('2026-10-01T05:30:00.000Z'))
+
+    def test_index_without_summary_is_a_problem(self):
+        problem = 'demo/index has no summary: the domain description that list_domains shows'
+        self.assertIn(problem, self.s.check('demo')['problems'])
+        r = self.s.read('demo/topic', heading='Rules')
+        self.assertTrue(self.s.patch_section('append', 'More.', section_id=r['section_id'])['ok'])  # existing debt does not refuse
+        idx = self.s.read('demo/index', heading='Demo knowledge index')
+        self.s.patch_section('replace_own_text', 'Primary knowledge base for the demo.', idx['version'], section_id=idx['section_id'],
+                             summary='The demo: a fixture domain for the tests.')
+        self.assertNotIn(problem, self.s.check('demo')['problems'])
+        self.assertNotIn('[[demo/index]]', self.s.render_note('demo/index'))  # the index is not a row of its own catalog
+        self.assertEqual(self.s.list_domains()['domains'][0]['description'], 'The demo: a fixture domain for the tests.')
+
+    def test_void_an_accepted_decision(self):
+        # Real case (memory-ops events 829-833): a mistaken acceptance could not be undone honestly.
+        self.refused('reason_required', self.s.set_decision_status, 'demo', 'D02', 'void')
+        self.refused('owner_only', self.worker().set_decision_status, 'demo', 'D02', 'void', reason='x')
+        self.refused('bad_transition', self.s.set_decision_status, 'demo', 'P01', 'void', reason='x')
+        out = self.s.set_decision_status('demo', 'D02', 'void', reason='accepted from a question, not a decision')
+        self.assertEqual(out['status'], 'void')
+        content = self.s.read('demo/decisions', heading='D02 — No export (2026-10-02)')['content']
+        self.assertIn(f'- **Status:** void\n- **Void reason:** accepted from a question, not a decision ({datetime.date.today()})\n', content)
+        self.assertIn('- **Decision:** no markdown export.', content)  # the record stays
+        b = self.s.brief('demo')['brief']
+        self.assertIn('accepted: D01\n', b)
+        self.assertIn('void: D02', b)
+        self.assertEqual(self.s._one("SELECT status FROM decisions WHERE id = 'D02'")[0], 'void')
+        self.refused('bad_transition', self.s.set_decision_status, 'demo', 'D02', 'accepted')
+        self.refused('superseded_by_required', self.s.set_decision_status, 'demo', 'D01', 'superseded', superseded_by='D02')
+        self.assertIn('void', json.loads(self.s._one("SELECT body FROM events WHERE op = 'tool:set_decision_status'")[0])['to'])
+
+    def test_status_item_update(self):
+        # Real case (memory-ops event 796): an open item's text could not be changed.
+        item = self.s.status_item('demo', 'add', kind='open', text='Old text')['item_id']
+        self.refused('owner_only', self.worker().status_item, 'demo', 'update', item_id=item, text='x')
+        self.refused('bad_item', self.s.status_item, 'demo', 'update', item_id=item, text=' ')
+        self.refused('bad_item', self.s.status_item, 'demo', 'update', item_id=item, text='x', kind='wish')
+        self.s.status_item('demo', 'update', item_id=item, text='New text', kind='blocker')
+        self.assertIn(f'[#{item} blocker] New text', self.s.brief('demo')['brief'])
+        self.assertNotIn('Old text', self.s.brief('demo')['brief'])
+        e = json.loads(self.s._one("SELECT body FROM events WHERE op = 'tool:status_item' ORDER BY id DESC LIMIT 1")[0])
+        self.assertEqual((e['old_text'], e['old_kind'], e['text'], e['kind']), ('Old text', 'open', 'New text', 'blocker'))
+        self.s.status_item('demo', 'close', item_id=item)
+        self.refused('not_open', self.s.status_item, 'demo', 'update', item_id=item, text='y')
+
+    def test_older_schema_migrates_and_allows_void(self):
+        from apex_memory.backends.base import SQL
+        url = self.new_url('older')
+        old = open_backend(url)
+        files = sorted((SQL / old.name).glob('*.sql'))
+        with old.transaction():
+            for f in files[:-1]:
+                old.run_script(f.read_text())
+            old.set_schema_version(len(files) - 1)
+        copy_store(self.s.db, old)
+        old.close()
+        before = self.snapshot(self.s)
+        s = Store(url, 'test')
+        self.addCleanup(s.db.close)
+        self.assertEqual((s.db.schema_version(), self.snapshot(s)), (len(files), before))
+        self.assertTrue(s.set_decision_status('demo', 'D02', 'void', reason='test')['ok'])
+
+    def test_server_instructions_start_with_domain_discovery(self):
+        from apex_memory.server import build
+        text = build(self.s).instructions
+        self.assertTrue(text.startswith('Call list_domains, choose the domains whose description matches the task, then brief(domain); '
+                                        'if none matches, ask the owner before create_domain.'), text)
+
     # ----- batch -----
 
     def test_batch_writes_cross_linked_pages(self):
@@ -345,7 +468,7 @@ class MemoryTest(unittest.TestCase):
         out = self.s.batch(ops, task_id='T7')
         self.assertEqual([r['ok'] for r in out['results']], [True, True, True])
         self.assertEqual(out['results'][2]['path'], 'demo/b')
-        self.assertEqual(self.s.check('demo')['problems'], ["decision P02 needs exactly one '- **Status:**' line (has 0)"])
+        self.assertEqual(self.s.check('demo')['problems'], [self.no_desc('demo')] + ["decision P02 needs exactly one '- **Status:**' line (has 0)"])
         self.assertEqual([e['op'] for e in self.s.log_query('demo', task_id='T7')['entries']], ['LINK A AND B'])
         self.assertEqual(len(self.s.log_query('demo', task_id='T7', include_tool=True)['entries']), 3)
 
@@ -473,7 +596,7 @@ class MemoryTest(unittest.TestCase):
         self.assertEqual((out['links_rewritten'], out['promoted']), (1, False))
         self.assertIn('a link to [[demo/deep-dive]].', self.s.render_note('demo/topic'))
         self.assertIn('| [[demo/deep-dive]] | A note in a subfolder |', self.s.render_note('demo/index'))
-        self.assertEqual(self.s.check('demo')['problems'], ["decision P02 needs exactly one '- **Status:**' line (has 0)"])
+        self.assertEqual(self.s.check('demo')['problems'], [self.no_desc('demo')] + ["decision P02 needs exactly one '- **Status:**' line (has 0)"])
         self.assertEqual({l['from'] for l in self.s.links('demo/deep-dive', 'in')['links']}, {'demo/topic'})
         self.refused('bad_path', self.s.move, 'demo/decisions', 'demo/register')
         self.refused('exists', self.s.move, 'demo/topic', 'demo/deep-dive')
@@ -488,7 +611,7 @@ class MemoryTest(unittest.TestCase):
         self.refused('owner_only', w.status_item, 'demo', 'add', kind='open', text='x')
         self.refused('owner_only', w.set_decision_status, 'demo', 'P01', 'accepted')
         self.assertNotIn('demo/working/bot/scratch', self.s.render_note('demo/index'))  # not in the index, not a missing summary
-        self.assertEqual(self.s.check('demo')['problems'], ["decision P02 needs exactly one '- **Status:**' line (has 0)"])
+        self.assertEqual(self.s.check('demo')['problems'], [self.no_desc('demo')] + ["decision P02 needs exactly one '- **Status:**' line (has 0)"])
         self.assertIn('demo/working/bot/scratch', w.brief('demo')['brief'])
         self.assertFalse([h for h in self.s.search('Trying', scope='demo')['hits'] if h.get('path', '').startswith('demo/working')])
         self.assertTrue([h for h in w.search('Trying', scope='demo')['hits'] if h.get('path') == 'demo/working/bot/scratch'])
@@ -645,7 +768,7 @@ class MemoryTest(unittest.TestCase):
         self.s.create_note('demo2/sub/future-note', 'Future', 'arrived', '# Future\n', 'a', 'b', '2026-10-12 — t')
         self.s.create_note('demo2/elsewhere', 'Later', 'moved in', '# Later\n', 'a', 'b', '2026-10-12 — t')
         self.s.move('demo2/elsewhere', 'demo2/later')
-        self.assertEqual(self.s.check('demo2')['problems'], [])
+        self.assertEqual(self.s.check('demo2')['problems'], [self.no_desc('demo2')])
 
     def test_r9_summary_added_later_goes_to_the_end_of_the_index(self):
         self.s.db.execute("UPDATE notes SET summary = NULL, catalog_position = NULL WHERE path = 'demo/sub/deep'")
@@ -701,7 +824,7 @@ class MemoryTest(unittest.TestCase):
 
     def test_legacy_domain_imports_as_written(self):
         rep = self.import_extra('legacy', self.LEGACY)
-        self.assertEqual(rep['problems'], [])  # linked-only note counts as indexed; D1/D2 not yet on the Status-line rule
+        self.assertEqual(rep['problems'], [self.no_desc('legacy')])  # linked-only note counts as indexed; D1/D2 not yet on the Status-line rule
         self.assertEqual(rep['log_entries'], 2)
         self.assertEqual(len(rep['kept_as_written']), 3)  # index, status, log prefix
         self.assertEqual(verify_domain(self.s, self.dir / 'legacy'), [])
@@ -718,7 +841,7 @@ class MemoryTest(unittest.TestCase):
         # Real case (memory-ops event 199): the first Status line made every older record a new problem.
         d1 = self.s.read('legacy/decisions', heading='D1 — First, 2026-09-13')
         self.assertTrue(self.s.patch_section('append', '- **Status:** accepted', section_id=d1['section_id'])['ok'])
-        self.assertEqual(self.s.check('legacy')['problems'], ["decision D2 needs exactly one '- **Status:**' line (has 0)"])  # existing debt
+        self.assertEqual(self.s.check('legacy')['problems'], [self.no_desc('legacy'), "decision D2 needs exactly one '- **Status:**' line (has 0)"])  # existing debt
         top = self.s.read('legacy/decisions', heading='Decisions')
         info = self.refused('check_failed', self.s.patch_section, 'append', '# D3 — Third, 2026-10-12\n\nNo status line.', section_id=top['section_id'])
         self.assertEqual(info['problems'], ["decision D3 needs exactly one '- **Status:**' line (has 0)"])  # a new record is checked
@@ -726,10 +849,10 @@ class MemoryTest(unittest.TestCase):
     def test_import_resolves_links_from_other_domains_and_empty_anchors(self):
         self.import_extra('first', {'index.md': '# First\n\n## Catalog\n\n| [[first/page]] | p |\n',
                                     'page.md': '# Page\n\nSee [[second/notes#Details]] and [[first/page#]].\n'})
-        self.assertEqual(self.s.check('first')['problems'], [])  # 'second' is not in the store yet: an external link
+        self.assertEqual(self.s.check('first')['problems'], [self.no_desc('first')])  # 'second' is not in the store yet: an external link
         self.import_extra('second', {'index.md': '# Second\n\n## Catalog\n\n| [[second/notes]] | n |\n',
                                      'notes.md': '# Notes\n\n## Details\n\nHere.\n'})
-        self.assertEqual(self.s.check('first')['problems'], [])
+        self.assertEqual(self.s.check('first')['problems'], [self.no_desc('first')])
 
     def test_memory_ops_captures_refusals_and_errors(self):
         self.import_extra('memory-ops', {'index.md': '# Memory ops\n\n## Catalog\n\n| [[memory-ops/log]] | the log |\n',
@@ -977,7 +1100,7 @@ class PostgresMemoryTest(MemoryTest):
             alias.migrate()
             self.assertEqual(alias.one('SELECT current_schema()')[0], scratch)
         self.assertEqual([r['path'] for r in legacy.search('notes', 'cafe')], ['demo/cafe'])
-        self.assertEqual(legacy.schema_version(), 2)
+        self.assertEqual(legacy.schema_version(), len(list((SQL / 'postgres').glob('*.sql'))))
 
     def test_search_path_aliases_share_the_writer_lock(self):
         import psycopg
