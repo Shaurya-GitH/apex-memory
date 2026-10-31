@@ -455,6 +455,27 @@ class MemoryTest(unittest.TestCase):
         self.assertTrue(text.startswith('Call list_domains, choose the domains whose description matches the task, then brief(domain); '
                                         'if none matches, ask the owner before create_domain.'), text)
 
+    # ----- read suggestions -----
+
+    def test_not_found_suggests_candidates(self):
+        # Real cases (memory-ops events 350, 523, 735, 754, 976, 992): reads that missed gave no way forward.
+        info = self.refused('not_found', self.s.read, 'demo/decisions', heading='D01 — Use SQLite')  # date suffix missing
+        self.assertEqual(info['candidates'][0]['heading_path'], ['Decisions', 'Accepted', 'D01 — Use SQLite (2026-10-01)'])
+        self.assertIn('section_id', info['candidates'][0])
+        info = self.refused('not_found', self.s.read, 'demo/decisions', heading=['Proposals', 'P01 — Vectors later'])  # wrong parent
+        self.assertEqual(info['candidates'][0]['heading_path'], ['Decisions', 'Proposals (not yet accepted)', 'P01 — Vectors later'])
+        info = self.refused('not_found', self.s.read, 'demo/topic', heading='Detail')
+        self.assertEqual(info['candidates'][0]['heading_path'], ['Topic', 'Rules', 'Details'])
+        self.assertLessEqual(len(info['candidates']), 5)
+        self.assertEqual(self.refused('not_found', self.s.read, 'demo/topic', heading='Zebra crossing')['candidates'], [])
+        self.assertEqual(self.refused('not_found', self.s.read, 'demo/topik')['candidates'][0], 'demo/topic')
+        self.assertIn('demo/sub/deep', self.refused('not_found', self.s.read, 'demo/deep')['candidates'])
+        info = self.refused('path_required', self.s.read)
+        self.assertIn('section_id', info['hint'])
+        self.assertIn('heading=[]', self.refused('heading_required', self.s.patch_section, 'append', 'x', path='demo/topic')['hint'])
+        self.assertEqual(self.refused('not_found', self.s.patch_section, 'append', 'x', path='demo/topic', heading='Detail')['candidates'][0]['heading_path'],
+                         ['Topic', 'Rules', 'Details'])
+
     # ----- batch -----
 
     def test_batch_writes_cross_linked_pages(self):

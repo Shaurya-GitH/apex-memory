@@ -4,7 +4,7 @@ Every write tool runs in one transaction: mutate -> guards -> check (any new pro
 event -> commit. Tools return plain dicts and raise Refused for expected failures (version conflict, failed check,
 guard). The database is reached only through a backend (apex_memory.backends); the SQL here is neutral.
 """
-import collections, contextlib, datetime, functools, inspect, json, re, threading, uuid
+import collections, contextlib, datetime, difflib, functools, inspect, json, re, threading, uuid
 
 from .backends import open_backend
 
@@ -270,7 +270,11 @@ class Store:
     def _note(self, path):
         n = self._one('SELECT * FROM notes WHERE path = ?', path)
         if not n:
-            raise Refused('not_found', path=path)
+            if not path:
+                raise Refused('path_required', hint='give path (a whole note), path and heading (one section), or section_id')
+            domain = path.split('/')[0]
+            pool = [r[0] for r in self._q('SELECT path FROM notes WHERE domain = ?', domain)] or [r[0] for r in self._q('SELECT path FROM notes')]
+            raise Refused('not_found', path=path, candidates=_closest(path, pool))
         return n
 
     def _sections(self, note):
@@ -304,17 +308,27 @@ class Store:
             return t
         self._note(path)
         if heading is None:
-            raise Refused('heading_required', path=path)
+            raise Refused('heading_required', path=path, hint='give heading (text or path; heading=[] is the text before the first heading) or section_id')
         if isinstance(heading, list):
             t = self._one('SELECT * FROM sections WHERE note = ? AND heading_path = ?', path, hp(heading))
             if not t:
-                raise Refused('not_found', path=path, heading=heading)
+                raise Refused('not_found', path=path, heading=heading, candidates=self._close_headings(path, heading[-1] if heading else ''),
+                              hint='read the note without heading for its outline')
             return t
         rows = [r for r in self._sections(path) if r['heading'] == heading or (json.loads(r['heading_path']) or [''])[-1] == heading]
         if len(rows) != 1:
             raise Refused('not_found' if not rows else 'ambiguous_heading', path=path, heading=heading,
-                          candidates=[{'section_id': r['id'], 'heading_path': json.loads(r['heading_path'])} for r in rows])
+                          candidates=[self._candidate(r) for r in rows] or self._close_headings(path, heading),
+                          hint='use a candidate section_id, or read the note without heading for its outline')
         return rows[0]
+
+    def _candidate(self, r):
+        return {'section_id': r['id'], 'heading_path': json.loads(r['heading_path'])}
+
+    def _close_headings(self, path, heading):
+        """Up to 5 sections of the note whose heading is closest to `heading`; a missing date suffix still matches."""
+        rows = {_bare(r['heading']): r for r in reversed(self._sections(path)) if r['heading']}
+        return [self._candidate(rows[h]) for h in _closest(_bare(heading), list(rows))]
 
     def _touch(self, note):
         self.db.execute('UPDATE notes SET version = version + 1, updated_at = ? WHERE path = ?', (today(), note))
@@ -1215,6 +1229,18 @@ def _utc(value, end=False):
 
 def _cap(text, limit):
     return text if len(text) <= limit else text[:limit] + f'\n… [truncated at {limit} of {len(text)} chars; read by section]'
+
+
+def _bare(heading):
+    """A heading compared loosely: lower case, without a trailing '(YYYY-MM-DD)' or ' [n]' suffix."""
+    return re.sub(r'\s*(\(\d{4}-\d{2}-\d{2}\)|\[\d+\])\s*$', '', heading or '').strip().lower()
+
+
+def _closest(word, pool, n=5, cutoff=0.6):
+    """The pool entries closest to word: those that contain it or that it contains first, then difflib's close matches."""
+    near = [p for p in pool if word and (word in p or p in word)]
+    near.sort(key=lambda p: -difflib.SequenceMatcher(None, word, p).ratio())
+    return list(dict.fromkeys(near + difflib.get_close_matches(word, pool, n, cutoff)))[:n]
 
 
 def _like(text):
