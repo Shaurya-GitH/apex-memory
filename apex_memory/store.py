@@ -592,13 +592,16 @@ class Store:
                               f"(verified_at {n['verified_at'] or 'missing'})")
         return out
 
-    def patch_section(self, op: str, content: str, if_version: int, section_id: int | None = None, path: str | None = None,
+    def patch_section(self, op: str, content: str, if_version: int | None = None, section_id: int | None = None, path: str | None = None,
                       heading: list[str] | str | None = None, summary: str | None = None, task_id: str | None = None) -> dict:
-        """Edit one section, version-checked. op: 'replace' (content = what read returned for the section, subsections
-        included, headings relative), 'append' (after the subtree; may add subsections) or 'prepend' (before the own
-        text; no headings). Optional summary updates the note's index line. All or nothing, with the checks inside."""
+        """Edit one section. op: 'replace' (content = what read returned for the section, subsections included,
+        headings relative), 'append' (after the subtree; may add subsections) or 'prepend' (before the own text; no
+        headings). replace and prepend need if_version (the section version read returned); append needs none.
+        Optional summary updates the note's index line. All or nothing, with the checks inside."""
         if op not in ('replace', 'append', 'prepend'):
             raise Refused('bad_op', op=op, ops=['replace', 'append', 'prepend'])
+        if if_version is None and op != 'append':
+            raise Refused('version_required', op=op, hint='give if_version: the section version that read returned')
         t0 = self._target(section_id, path, heading)
         domain = t0['note'].split('/')[0]
         self._need_write(t0['note'])
@@ -607,7 +610,7 @@ class Store:
             t = self._one('SELECT * FROM sections WHERE id = ?', t0['id'])
             rows = self._subtree(t)
             self._check_leases([r['id'] for r in rows + self._ancestors(t)])
-            if t['version'] != if_version:
+            if op != 'append' and t['version'] != if_version:  # appending at the end does not depend on what is there
                 raise Refused('version_conflict', section_id=t['id'], current_version=t['version'], content=self._subtree_text(t, rows))
             if any(r['generated'] for r in rows):
                 raise Refused('generated_section', section_id=t['id'],

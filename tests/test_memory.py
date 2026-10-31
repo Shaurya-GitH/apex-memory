@@ -269,11 +269,26 @@ class MemoryTest(unittest.TestCase):
         other.patch_section('append', 'Edit from another agent.', b['version'], section_id=b['section_id'])
         out = self.s.patch_section('append', 'Edit to a different section.', a['version'], section_id=a['section_id'])
         self.assertTrue(out['ok'])
-        info = self.refused('version_conflict', self.s.patch_section, 'append', 'stale', b['version'], section_id=b['section_id'])
+        info = self.refused('version_conflict', self.s.patch_section, 'prepend', 'stale', b['version'], section_id=b['section_id'])
         self.assertEqual(info['current_version'], b['version'] + 1)
         self.assertIn('Edit from another agent.', info['content'])
         self.assertNotEqual(self.s.run_id, other.run_id)
         other.db.close()
+
+    def test_append_needs_no_version(self):
+        # Real case (memory-ops events 780, 853): appends to a big 'Accepted' parent refused as version_conflict.
+        acc = self.s.read('demo/decisions', heading='Accepted')
+        self.s.patch_section('append', '# D03 — First (2026-10-12)\n- **Status:** accepted', acc['version'], section_id=acc['section_id'])
+        out = self.s.patch_section('append', '# D04 — Second (2026-10-12)\n- **Status:** accepted', acc['version'], section_id=acc['section_id'])
+        self.assertTrue(out['ok'])  # a stale version is not enforced for append
+        self.assertTrue(self.s.patch_section('append', 'No version given.', path='demo/topic', heading='Rules')['ok'])
+        self.assertIn('accepted: D01, D02, D03, D04', self.s.brief('demo')['brief'])
+        for op in ('replace', 'prepend'):
+            self.refused('version_required', self.s.patch_section, op, 'x', path='demo/topic', heading='Rules')
+        b = Store(self.db, 'other')
+        self.addCleanup(b.db.close)
+        b.lease('take', path='demo/topic', heading='Rules')
+        self.refused('leased', self.s.patch_section, 'append', 'x', path='demo/topic', heading='Rules')  # leases still apply
 
     def test_patch_event_keeps_previous_text(self):
         r = self.s.read('demo/topic', heading=['Topic', 'Notes'])
