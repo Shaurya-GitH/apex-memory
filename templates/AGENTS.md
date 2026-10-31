@@ -7,7 +7,7 @@
 Since `<date>`, all knowledge lives in the apex-memory store at `<database URL or path>`. Use only the `<server-name>` MCP tools to get to it.
 
 1. At the start of a session, call `list_domains`. Call it again when the subject of the work changes. The result gives each domain with its description, and the global preferences of the owner.
-2. Select the domains whose description agrees with the subject of the work. Select by subject, not by the repository or the tool name. Zero, one or more domains can agree. Use only the domains that agree.
+2. Select the domains whose description agrees with the subject of the work. Select by subject, not by the repository or the tool name. Usually one domain agrees. Use a second domain only when the task has an explicit dependency on that domain. Use only the domains that agree.
 3. Call `brief` for each domain that you selected.
 4. If no description agrees, do not put the knowledge in an unrelated domain. Use the procedure in [When no domain agrees](#when-no-domain-agrees).
 

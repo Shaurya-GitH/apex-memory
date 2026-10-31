@@ -16,7 +16,8 @@ from .store import OPS_DOMAIN, TOOLS, Refused, Store
 def build(store):
     server = MCPServer('apex-memory', instructions=(
         'At the start and when the subject of the work changes, call list_domains and choose the domains whose description '
-        'matches the work by subject (not repository or tool), then brief(domain). ' + (
+        'matches the work by subject (not repository or tool), then brief(domain). '
+        'Usually one domain fits: read a second only when the task has an explicit dependency on it. ' + (
             'If none matches and the work will produce knowledge worth keeping, ask the owner once, at the start of that work: '
             'create a knowledge base for <topic> (propose a name and a one-line description) or not. Yes: create_domain, then brief. '
             '"Never": preference(add, no domain, the owner\'s words as quote, text "No knowledge base for <topic>"); list_domains '

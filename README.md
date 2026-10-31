@@ -294,7 +294,7 @@ To import a folder of markdown notes as a domain, see [Import a folder of markdo
 The agent selects the knowledge base for the work. It does not use the repository name or the tool name.
 
 1. At the start of a session, the agent calls `list_domains`. It calls it again when the subject of the work changes.
-2. The agent selects the domains whose description agrees with the subject of the work. Zero, one or more domains can agree.
+2. The agent selects the domains whose description agrees with the subject of the work. Usually one domain agrees. The agent uses a second domain only when the task has an explicit dependency on that domain. In a test on 75 real tasks, this rule removed most of the unnecessary second domains.
 3. The agent calls `brief` for each domain that it selected.
 
 If no domain agrees, and the work will make knowledge that is important to keep, the agent asks the owner one time. It asks at the start of the work. It proposes a name and a description of one line.

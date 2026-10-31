@@ -526,7 +526,8 @@ class MemoryTest(unittest.TestCase):
         from apex_memory.server import build
         text = build(self.s).instructions
         self.assertTrue(text.startswith('At the start and when the subject of the work changes, call list_domains and choose the domains '
-                                        'whose description matches the work by subject (not repository or tool), then brief(domain).'), text)
+                                        'whose description matches the work by subject (not repository or tool), then brief(domain). '
+                                        'Usually one domain fits: read a second only when the task has an explicit dependency on it.'), text)
         for part in ('ask the owner once', 'create_domain', 'preference', 'No knowledge base for <topic>', 'Not now'):
             self.assertIn(part, text)
         worker = build(self.worker()).instructions
