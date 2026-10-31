@@ -63,7 +63,8 @@ This procedure installs the store with SQLite, connects Claude Code and creates 
 7. In the session, tell the agent to create your first domain with the tool `create_domain`. Give a name, a title and a description. See [Create a domain](#create-a-domain).
 8. Tell the agent to create the ops domain `memory-ops` with `create_domain`. The store records refusals and errors there.
 9. Copy [templates/AGENTS.md](templates/AGENTS.md) into your own `AGENTS.md` or `CLAUDE.md`. Replace its placeholders.
-10. In a new session, the agent calls `list_domains`. It selects the domain whose description agrees with the task. Then it calls `brief` with that domain.
+10. In a new session, the agent calls `list_domains`. It selects the domain whose description agrees with the subject of the work. Then it calls `brief` with that domain.
+11. If no domain agrees, the agent asks you one time if you want a knowledge base for the work. If you answer "never for this", the agent records a preference and does not ask again for that topic. See [Select a domain](#select-a-domain).
 
 If you have a folder of markdown notes, you can import it as a domain. See [Import a folder of markdown notes](#import-a-folder-of-markdown-notes).
 
@@ -286,6 +287,26 @@ A domain that you imported from markdown has no description. `list_domains` then
 
 To import a folder of markdown notes as a domain, see [Import a folder of markdown notes](#import-a-folder-of-markdown-notes).
 
+### Select a domain
+
+The agent selects the knowledge base for the work. It does not use the repository name or the tool name.
+
+1. At the start of a session, the agent calls `list_domains`. It calls it again when the subject of the work changes.
+2. The agent selects the domains whose description agrees with the subject of the work. Zero, one or more domains can agree.
+3. The agent calls `brief` for each domain that it selected.
+
+If no domain agrees, and the work will make knowledge that is important to keep, the agent asks the owner one time. It asks at the start of the work. It proposes a name and a description of one line.
+
+| Answer of the owner | What the agent does |
+| --- | --- |
+| Yes | It calls `create_domain` with that description, then `brief`. |
+| No, never for this topic | It calls `preference` with no domain. The text is "No knowledge base for <topic>". The quote is the words of the owner. It does not ask again for that topic. |
+| Not now | It records nothing. It does not ask again in this session. |
+
+`list_domains` gives the active preferences that apply to all domains, as `preferences: [{id, text}]`. Thus the agent sees each "never" answer at the start of a session, before it calls `brief`.
+
+A worker does not create a domain and does not record a preference. It tells the session of the owner that no domain agrees.
+
 ## Connect an MCP client
 
 The MCP server uses stdio. The client starts this command:
@@ -302,7 +323,7 @@ apex-memory serve --actor <name> --role <owner or worker>
 | `--ops-domain <name>` | The domain that gets the records of refusals and errors. The default is `memory-ops`. |
 | `--run-id <id>` | An id for this run. The default is a new UUID. Log entries keep it. |
 
-When the client connects, the server sends instructions to the agent. The instructions start with the rule for domains: call `list_domains`, select the domains whose description agrees with the task, then call `brief`. If no domain agrees, ask the owner before you call `create_domain`. The instructions also give the store id, the actor, the role and the main rules.
+When the client connects, the server sends instructions to the agent. The instructions start with the rule for domains in [Select a domain](#select-a-domain). The instructions for a worker tell it to report a missing domain to the session of the owner. The instructions also give the store id, the actor, the role and the main rules.
 
 ### Claude Code
 
@@ -372,7 +393,7 @@ Each tool returns a JSON object. A result has `"ok": true`. A refusal has `"ok":
 
 | Tool | What it does |
 | --- | --- |
-| `list_domains` | Shows each domain with its description, number of notes and time of the last log entry. `ops: true` marks the ops domain. All roles. |
+| `list_domains` | Shows each domain with its description, number of notes and time of the last log entry. `ops: true` marks the ops domain. `preferences` gives the active preferences that apply to all domains. All roles. |
 | `brief` | Gives the start read for a domain: store identity, number of problems, index, preferences, decisions, open status items and the last log entries. |
 | `search` | Finds text in notes, sections and log entries. `mode` is `bm25`, `exact` or `regex`. `scope` is a domain or folder; empty means all domains. |
 | `read` | Reads a full note, or one section and its subsections, with ids and versions. If the store cannot find the heading or the note, the refusal gives `candidates`. |

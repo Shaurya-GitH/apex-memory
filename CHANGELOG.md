@@ -16,6 +16,9 @@ Fixes from 16 days of real use (12 to 28 October 2026): about 60 refusals and 17
 - New `patch_section` operation `replace_own_text`: replaces only the text before the first subsection.
 - New tools `create_domain` (owner only) and `list_domains` (all roles). Each domain has a description: the summary of
   its index. `check` shows an index without a summary. The server instructions start with `list_domains`.
+- The agent selects domains by the subject of the work. If no domain agrees, the agent asks the owner one time if
+  it must create one. A "never" answer is a preference without a domain. `list_domains` gives these preferences as
+  `preferences`. A worker reports a missing domain to the session of the owner.
 - `set_decision_status` can change `accepted` to `void`, with a `reason`. The brief shows void decisions on their own
   line. Schema migrations: SQLite 002, Postgres 003.
 - `status_item` action `update` changes the text, and as an option the kind, of an open item.

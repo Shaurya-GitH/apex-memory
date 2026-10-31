@@ -1172,7 +1172,8 @@ class Store:
         """Every domain: its description (what it holds and when to choose it), note count, last log activity, and
         ops: true for the domain that records the memory system's own failures. Choose domains by description, then
         call brief. description_missing: true means the index has no summary; the first paragraph of the index stands
-        in for it."""
+        in for it. preferences: the owner's active preferences for every domain (e.g. "No knowledge base for <topic>":
+        do not ask again to create one)."""
         out = []
         for d in sorted(self._domains()):
             n = self._one('SELECT summary FROM notes WHERE path = ?', f'{d}/index')
@@ -1186,7 +1187,8 @@ class Store:
             row.update(notes=self._one('SELECT count(*) FROM notes WHERE domain = ?', d)[0], last_log=last and local(last),
                        ops=d == self.ops_domain)
             out.append(row)
-        return {'ok': True, 'domains': out}
+        prefs = [{'id': r['id'], 'text': r['text']} for r in self._q('SELECT id, text FROM preferences WHERE retired_at IS NULL AND domain IS NULL ORDER BY id')]
+        return {'ok': True, 'domains': out, 'preferences': prefs}
 
     def batch(self, ops: list[dict], task_id: str | None = None) -> dict:
         """Several writes in one transaction, all or nothing: ops = [{"tool": name, "args": {...}}, ...] with tools

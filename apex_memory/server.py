@@ -15,14 +15,21 @@ from .store import OPS_DOMAIN, TOOLS, Refused, Store
 
 def build(store):
     server = MCPServer('apex-memory', instructions=(
-        'Call list_domains, choose the domains whose description matches the task, then brief(domain); '
-        'if none matches, ask the owner before create_domain. '
+        'At the start and when the subject of the work changes, call list_domains and choose the domains whose description '
+        'matches the work by subject (not repository or tool), then brief(domain). ' + (
+            'If none matches and the work will produce knowledge worth keeping, ask the owner once, at the start of that work: '
+            'create a knowledge base for <topic> (propose a name and a one-line description) or not. Yes: create_domain, then brief. '
+            '"Never": preference(add, no domain, the owner\'s words as quote, text "No knowledge base for <topic>"); list_domains '
+            'returns these preferences, so never ask again for that topic. "Not now": record nothing; do not ask again this session. '
+            if store.role == 'owner' else
+            "If none matches, do not create a domain or record a preference: report the gap to the owner's session. ") +
         f'Memory store {store.store_id} at {store.location} (actor {store.actor}, role {store.role}). '
         'Search, then read one section; edit with patch_section using the version read returned '
         '(replace accepts exactly what read returned). Writes are all-or-nothing and run the checks; a refusal says why. '
         'Log meaningful work with log_append; status changes with status_item; decision status only with set_decision_status. '
-        f'Scratch notes go under <domain>/working/{store.actor}/ (a worker writes only there); record the owner\'s preferences '
-        'with preference, quoting the owner; take a lease before a long edit.'))
+        f'Scratch notes go under <domain>/working/{store.actor}/ (a worker writes only there); ' + (
+            "record the owner's preferences with preference, quoting the owner; " if store.role == 'owner' else '') +
+        'take a lease before a long edit.'))
     for name in TOOLS:
         server.add_tool(_safe(getattr(store, name)), name=name, description=getattr(Store, name).__doc__)
     return server

@@ -6,10 +6,22 @@
 
 Since `<date>`, all knowledge lives in the apex-memory store at `<database URL or path>`. Use only the `<server-name>` MCP tools to get to it.
 
-1. At the start of a task, call `list_domains`. The result gives each domain with its description.
-2. Select the domains whose description agrees with the subject of the task. Select by subject, not by the repository or the tool name.
+1. At the start of a session, call `list_domains`. Call it again when the subject of the work changes. The result gives each domain with its description, and the global preferences of the owner.
+2. Select the domains whose description agrees with the subject of the work. Select by subject, not by the repository or the tool name. Zero, one or more domains can agree. Use only the domains that agree.
 3. Call `brief` for each domain that you selected.
-4. If no description agrees with the task, ask the owner before you call `create_domain`. Do not put the knowledge in an unrelated domain.
+4. If no description agrees, do not put the knowledge in an unrelated domain. Use the procedure in [When no domain agrees](#when-no-domain-agrees).
+
+### When no domain agrees
+
+Use this procedure only if the work will make knowledge that is important to keep, for example decisions, contracts, findings or plans. Do not use it for a single question.
+
+1. Look at the `preferences` that `list_domains` gives. If a preference says "No knowledge base for <topic>" for this topic, do not ask. Do the work without a domain.
+2. Ask the owner one time, at the start of the work. Ask one short question. Propose a name and a description of one line. Example: "Do you want a knowledge base `tax-filing` for this work: tax returns and their deadlines?"
+3. Do the step that agrees with the answer of the owner:
+   - **Yes:** Call `create_domain` with that name and description. Then call `brief`.
+   - **No, never for this topic:** Call `preference` with `action="add"` and no domain. For `text`, write "No knowledge base for <topic>". For `owner_quote`, give the words of the owner. Do not ask again for that topic.
+   - **Not now:** Do not record the answer. Do not ask again in this session.
+4. A worker (role `worker`) does not create a domain and does not record a preference. A worker tells the session of the owner that no domain agrees.
 
 - The domain with `ops: true` holds the failures and friction of the memory system itself. See [Report memory-system problems](#report-memory-system-problems).
 - Use only the relevant domain for project context and log entries.

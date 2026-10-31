@@ -522,8 +522,27 @@ class MemoryTest(unittest.TestCase):
     def test_server_instructions_start_with_domain_discovery(self):
         from apex_memory.server import build
         text = build(self.s).instructions
-        self.assertTrue(text.startswith('Call list_domains, choose the domains whose description matches the task, then brief(domain); '
-                                        'if none matches, ask the owner before create_domain.'), text)
+        self.assertTrue(text.startswith('At the start and when the subject of the work changes, call list_domains and choose the domains '
+                                        'whose description matches the work by subject (not repository or tool), then brief(domain).'), text)
+        for part in ('ask the owner once', 'create_domain', 'preference', 'No knowledge base for <topic>', 'Not now'):
+            self.assertIn(part, text)
+        worker = build(self.worker()).instructions
+        self.assertTrue(worker.startswith(text.split('.')[0]), worker)
+        self.assertIn("report the gap to the owner's session", worker)
+        self.assertNotIn('create_domain', worker)
+
+    def test_list_domains_returns_global_preferences(self):
+        # Part A: a "never" answer (a global preference) is seen at session start without a domain brief.
+        self.s.create_domain('newdom', 'New domain', 'Holds X.')
+        never = self.s.preference('add', text='No knowledge base for tax filing', owner_quote='no, never for this')['item_id']
+        self.s.preference('add', text='Only in newdom', owner_quote='only here', domain='newdom')
+        gone = self.s.preference('add', text='Retired rule', owner_quote='old')['item_id']
+        self.s.preference('retire', item_id=gone)
+        self.assertEqual(self.s.list_domains()['preferences'], [{'id': never, 'text': 'No knowledge base for tax filing'}])
+        w = self.worker()
+        self.assertEqual(w.list_domains()['preferences'], [{'id': never, 'text': 'No knowledge base for tax filing'}])
+        self.refused('owner_only', w.preference, 'add', text='No knowledge base for x', owner_quote='never')
+        self.refused('owner_only', w.create_domain, 'x', 'X', 'Holds X.')
 
     # ----- read suggestions -----
 
