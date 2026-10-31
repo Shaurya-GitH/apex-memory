@@ -1,0 +1,775 @@
+#!/usr/bin/env python3
+"""Verification harness for apex-memory: drive the real MCP stdio server and CLI the way an agent does.
+
+  uv run --extra postgres scripts/verify launch [--backend sqlite|postgres] [--run NAME]
+  uv run --extra postgres scripts/verify doctor                      read-only: is this run worth driving?
+  uv run --extra postgres scripts/verify features                    list the mapped features
+  uv run --extra postgres scripts/verify drive <feature>             one journey, on a fresh clone of the seed store
+  uv run --extra postgres scripts/verify all                         every journey; exit 1 if any fails
+  uv run --extra postgres scripts/verify call <tool> ['<json>'] [--role worker]   one MCP call on the run's manual store
+  uv run --extra postgres scripts/verify cleanup                     remove what this run started; keep the evidence
+
+Each run lives in .verify/<run>/ (own HOME, own databases, own Postgres container) and never touches a user's store.
+Evidence: .verify/<run>/evidence/<feature>-<n>/{transcript.jsonl,result.json}; cleanup keeps it.
+The feature map: .claude/skills/verify-apex-memory/features/.
+"""
+import argparse, asyncio, contextlib, datetime, importlib.metadata, json, os, pathlib, shutil, socket, subprocess, sys, time, traceback
+
+REPO = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+from apex_memory.backends import open_backend  # noqa: E402
+from apex_memory.backends.base import SQL  # noqa: E402
+from apex_memory.store import Store, TOOLS  # noqa: E402
+
+VERIFY = REPO / '.verify'
+PG_PASSWORD = 'verify'
+OWNER, WORKER = 'verify-owner', 'verify-worker'
+FORBIDDEN = [pathlib.Path.home() / '.apex-memory', pathlib.Path.home() / '.office-ai']
+
+
+# ---------- run state ----------
+
+def run_dir(name=None):
+    latest = VERIFY / 'latest'
+    name = name or (latest.read_text().strip() if latest.exists() else None)
+    if not name or not (VERIFY / name / 'state.json').exists():
+        sys.exit(f'no run {name!r}: start one with scripts/verify launch')
+    return VERIFY / name
+
+
+def state(d):
+    return json.loads((d / 'state.json').read_text())
+
+
+def url_for(st, db):
+    if st['backend'] == 'sqlite':
+        return 'sqlite://' + str(pathlib.Path(st['dir']) / 'db' / f'{db}.db')
+    return f"postgresql://postgres:{PG_PASSWORD}@127.0.0.1:{st['port']}/{db}"
+
+
+def safe(url):
+    path = url.removeprefix('sqlite://')
+    if '://' not in path and any(pathlib.Path(path).resolve().is_relative_to(f) for f in FORBIDDEN):
+        sys.exit(f'refusing to touch a real store: {path}')
+    return url
+
+
+def shown(url):
+    return url.replace(f':{PG_PASSWORD}@', ':***@')
+
+
+def env_for(st):
+    env = {k: v for k, v in os.environ.items() if not k.startswith('APEX_MEMORY_')}
+    return env | {'HOME': str(pathlib.Path(st['dir']) / 'home')}
+
+
+def apex_bin():
+    exe = shutil.which('apex-memory', path=str(pathlib.Path(sys.executable).parent))
+    if not exe:
+        sys.exit('apex-memory is not installed in this environment: run with uv run --extra postgres scripts/verify')
+    return exe
+
+
+def pg_admin(st):
+    import psycopg
+    return psycopg.connect(url_for(st, 'postgres'), autocommit=True)
+
+
+def clone(st, name):
+    """A fresh copy of the seed store (Postgres: CREATE DATABASE ... TEMPLATE seed)."""
+    if st['backend'] == 'sqlite':
+        shutil.copy(pathlib.Path(st['dir']) / 'db' / 'seed.db', pathlib.Path(st['dir']) / 'db' / f'{name}.db')
+    else:
+        with pg_admin(st) as c:
+            c.execute(f'CREATE DATABASE "{name}" TEMPLATE seed')
+    return safe(url_for(st, name))
+
+
+def empty_store(st, name):
+    """A URL for a new, empty store on the run's backend."""
+    if st['backend'] == 'postgres':
+        with pg_admin(st) as c:
+            c.execute(f'CREATE DATABASE "{name}"')
+    return safe(url_for(st, name))
+
+
+def next_name(st, feature):
+    d = pathlib.Path(st['dir']) / 'evidence'
+    n = 1
+    while (d / f'{feature}-{n}').exists():
+        n += 1
+    return f'{feature}-{n}'
+
+
+# ---------- launch / doctor / cleanup ----------
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+
+def launch(a):
+    name = a.run or f"{a.backend}-{datetime.datetime.now():%Y%m%d-%H%M%S}"
+    d = VERIFY / name
+    if d.exists():
+        sys.exit(f'{d} exists: pick another --run name or clean it up')
+    for sub in ('home', 'db', 'evidence', 'work'):
+        (d / sub).mkdir(parents=True)
+    st = {'run': name, 'backend': a.backend, 'dir': str(d), 'created': datetime.datetime.now().isoformat(timespec='seconds'),
+          'version': importlib.metadata.version('apex-memory'), 'commit': _git('rev-parse', '--short', 'HEAD'), 'container': None, 'port': None}
+    if a.backend == 'postgres':
+        st['container'], st['port'] = f'apex-memory-verify-{name}', free_port()
+        subprocess.run(['docker', 'run', '-d', '--rm', '--name', st['container'], '--label', f'apex-memory-verify={name}',
+                        '-e', f'POSTGRES_PASSWORD={PG_PASSWORD}', '-p', f"127.0.0.1:{st['port']}:5432", 'postgres:17'],
+                       check=True, capture_output=True)
+        (d / 'state.json').write_text(json.dumps(st, indent=2))  # cleanup can find the container from here on
+        _wait_pg(st)
+        with pg_admin(st) as c:
+            c.execute('CREATE DATABASE seed')
+    (d / 'state.json').write_text(json.dumps(st, indent=2))
+    (VERIFY / 'latest').write_text(name)
+    url = safe(url_for(st, 'seed'))
+    # Migrations through the real CLI, then the seed data the journeys need.
+    out = subprocess.run([apex_bin(), 'init', '--url', url], capture_output=True, text=True, env=env_for(st))
+    if out.returncode:
+        sys.exit(f'apex-memory init failed: {out.stderr}')
+    seed(url)
+    s = Store(url, OWNER)
+    st['store_id'] = s.store_id
+    s.db.close()
+    (d / 'state.json').write_text(json.dumps(st, indent=2))
+    print(f"READY run={name} backend={a.backend} store={shown(url)} home={d / 'home'}")
+
+
+def _wait_pg(st, timeout=90):
+    import psycopg
+    end = time.time() + timeout
+    while time.time() < end:  # the image's init server listens on a socket only: a TCP connection means the real server
+        try:
+            with pg_admin(st) as c:
+                c.execute('SELECT 1')
+            return
+        except psycopg.OperationalError:
+            time.sleep(0.5)
+    sys.exit(f"Postgres in {st['container']} did not accept connections within {timeout}s")
+
+
+API = """\
+# Atlas API
+
+The Atlas API serves map tiles to the apps.
+
+## Rate limits (2026-10-01)
+
+Each key gets 100 requests per minute. Commit 9f3c2d1 set the limit.
+
+## Auth
+
+Tokens expire after 24 hours.
+"""
+
+
+def seed(url):
+    """The baseline every journey starts from: three domains with descriptions (one is the ops domain), project
+    notes with links, decision records, a status item, a log entry and a worker's working note."""
+    s = Store(url, OWNER)
+    w = Store(url, WORKER, role='worker')
+    try:
+        s.create_domain('memory-ops', 'Memory ops', 'Failures and friction of the memory system itself. Not for project knowledge.')
+        s.create_domain('atlas', 'Atlas', 'The Atlas product: its map API, plans, contracts and decisions. Not for the website; use website.')
+        s.create_domain('website', 'Website', 'The marketing website: pages, copy and launch plans. Not for the Atlas product; use atlas.')
+        hdr = dict(decision_status='agreed', impl_status='built', evidence='2026-10-01 — seed data')
+        s.create_note('atlas/api', 'Atlas API', 'API contract of Atlas: rate limits and auth', API, **hdr)
+        s.create_note('atlas/roadmap', 'Atlas roadmap', 'What Atlas builds next', '# Roadmap\n\nShip offline tiles after [[atlas/api#Auth]] is stable.\n', **hdr)
+        s.create_note('website/launch', 'Launch plan', 'Website launch plan', '# Launch plan\n\nLaunch the new site in November.\n', **hdr)
+        s.patch_section('append', '# D01 — Cache tiles at the edge (2026-10-01)\n- **Status:** accepted\n- **Decision:** cache tiles for one hour.\n\n'
+                        '# D02 — Rate limit per key (2026-10-02)\n- **Status:** accepted\n- **Decision:** limit each key, not each IP.\n\n'
+                        '# P01 — Vector tiles\n- **Status:** proposed\n- **Proposal:** serve vector tiles.\n', path='atlas/decisions', heading='Atlas decisions')
+        s.status_item('atlas', 'add', kind='open', text='Write the API docs')
+        s.log_append('atlas', 'SEED', ['atlas/api'], 'verification seed', 'baseline created')
+        w.create_note(f'atlas/working/{WORKER}/draft', 'Draft', body='# Draft\n\nThe zephyr cache idea: keep hot tiles in memory.\n')
+        for dom in ('atlas', 'website', 'memory-ops'):
+            assert s.check(dom)['problems'] == [], (dom, s.check(dom)['problems'])
+    finally:
+        s.db.close()
+        w.db.close()
+
+
+def doctor(a):
+    d = run_dir(a.run)
+    st, bad = state(d), []
+    url = safe(url_for(st, 'seed'))
+    print(f"run {st['run']} · backend {st['backend']} · launched {st['created']} at {st['commit']}")
+    import apex_memory
+    if not pathlib.Path(apex_memory.__file__).resolve().is_relative_to(REPO):
+        bad.append(f'apex_memory is imported from {apex_memory.__file__}, not this checkout')
+    if not pathlib.Path(apex_bin()).resolve().is_relative_to(REPO):
+        bad.append(f'apex-memory resolves to {apex_bin()}, not this checkout')
+    if (v := importlib.metadata.version('apex-memory')) != st['version']:
+        bad.append(f"package version {v}, run launched with {st['version']}")
+    if pathlib.Path(env_for(st)['HOME']).resolve() == pathlib.Path.home().resolve():
+        bad.append('HOME is the real home')
+    if st['backend'] == 'postgres':
+        out = subprocess.run(['docker', 'inspect', '-f', '{{.State.Running}} {{index .Config.Labels "apex-memory-verify"}} '
+                              '{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}', st['container']], capture_output=True, text=True)
+        if out.stdout.split() != ['true', st['run'], str(st['port'])]:
+            bad.append(f"container {st['container']} is not ours or not running: {out.stdout.strip() or out.stderr.strip()}")
+    if not bad:
+        db = open_backend(url)
+        try:
+            sid = db.one("SELECT value FROM meta WHERE key = 'store_id'")
+            files = len(list((SQL / db.name).glob('*.sql')))
+            if not sid or sid[0] != st['store_id']:
+                bad.append(f'seed store id {sid and sid[0]} is not the one this run created ({st["store_id"]})')
+            if db.schema_version() != files:
+                bad.append(f'schema version {db.schema_version()}, this checkout has {files} migrations')
+        finally:
+            db.close()
+    if not bad:
+        async def probe():
+            async with Session(st, url, 'owner', None) as s:
+                return s.instructions, sorted(t.name for t in (await s.session.list_tools()).tools)
+        instructions, tools = asyncio.run(probe())
+        if tools != sorted(TOOLS):
+            bad.append(f'MCP tools {tools} differ from {sorted(TOOLS)}')
+        if st['store_id'] not in instructions:
+            bad.append('the server instructions name another store')
+    print('\n'.join(f'BAD {b}' for b in bad) or f"OK version {st['version']} · store {st['store_id']} · {shown(url)} · HOME {d / 'home'}")
+    sys.exit(1 if bad else 0)
+
+
+def cleanup(a):
+    d = run_dir(a.run)
+    st = state(d)
+    if st.get('container'):
+        subprocess.run(['docker', 'rm', '-f', st['container']], capture_output=True)  # only the container this run started
+    for sub in ('home', 'db', 'work'):
+        shutil.rmtree(d / sub, ignore_errors=True)
+    st['cleaned'] = datetime.datetime.now().isoformat(timespec='seconds')
+    (d / 'state.json').write_text(json.dumps(st, indent=2))
+    print(f"CLEANED run={st['run']}; evidence kept at {d / 'evidence'}")
+
+
+def _git(*args):
+    return subprocess.run(['git', *args], cwd=REPO, capture_output=True, text=True).stdout.strip()
+
+
+# ---------- driving ----------
+
+class Session:
+    """One MCP stdio server (apex-memory serve) and a client session to it, as an agent's MCP client runs it."""
+
+    def __init__(self, st, url, role, journey):
+        self.st, self.url, self.role, self.j = st, url, role, journey
+        self.actor = OWNER if role == 'owner' else WORKER
+
+    async def __aenter__(self):
+        from mcp.client.session import ClientSession
+        from mcp.client.stdio import StdioServerParameters, stdio_client
+        self.stack = contextlib.AsyncExitStack()
+        params = StdioServerParameters(command=apex_bin(), args=['serve', '--url', self.url, '--actor', self.actor, '--role', self.role],
+                                       env=env_for(self.st), cwd=self.st['dir'])
+        r, w = await self.stack.enter_async_context(stdio_client(params, errlog=open(os.devnull, 'w')))
+        self.session = await self.stack.enter_async_context(ClientSession(r, w))
+        self.instructions = (await self.session.initialize()).instructions
+        return self
+
+    async def __aexit__(self, *exc):
+        await self.stack.aclose()
+
+    async def __call__(self, tool, **args):
+        res = await self.session.call_tool(tool, args)
+        text = res.content[0].text if res.content else ''
+        try:
+            out = json.loads(text)
+        except ValueError:
+            out = {'ok': False, 'error': 'tool_error', 'text': text}
+        if self.j:
+            self.j.log({'role': self.role, 'tool': tool, 'args': args, 'result': out})
+        return out
+
+
+class Journey:
+    def __init__(self, st, feature, name):
+        self.st, self.feature, self.name = st, feature, name
+        self.dir = pathlib.Path(st['dir']) / 'evidence' / name
+        self.dir.mkdir(parents=True)
+        self.work = pathlib.Path(st['dir']) / 'work' / name
+        self.work.mkdir(parents=True)
+        self.transcript = open(self.dir / 'transcript.jsonl', 'w')
+        self.checks, self.step = [], 'start'
+
+    def log(self, entry):
+        self.transcript.write(json.dumps({'step': self.step, **entry}, ensure_ascii=False, default=str) + '\n')
+        self.transcript.flush()
+
+    def check(self, what, ok, detail=None):
+        self.checks.append({'step': self.step, 'check': what, 'ok': bool(ok), **({'detail': detail} if not ok and detail is not None else {})})
+        return ok
+
+    def refused(self, out, error):
+        return self.check(f'refused with {error}', out.get('ok') is False and out.get('error') == error, out)
+
+    def ok(self, out, what='ok'):
+        return self.check(what, out.get('ok') is True, out)
+
+    def rows(self, sql, *args):
+        """Side effects, read straight from the database (not through the tools)."""
+        db = open_backend(self.url)
+        try:
+            out = [dict(r) for r in db.query(sql, args)]
+        finally:
+            db.close()
+        self.log({'db': sql, 'args': args, 'rows': out})
+        return out
+
+    def cli(self, *args, url=None):
+        cmd = [apex_bin(), *[str(x) for x in args]] + (['--url', url or self.url] if url is not False else [])
+        p = subprocess.run(cmd, capture_output=True, text=True, env=env_for(self.st), cwd=self.work)
+        self.log({'cli': [shown(c) for c in cmd[1:]], 'exit': p.returncode, 'stdout': p.stdout[-4000:], 'stderr': p.stderr[-4000:]})
+        return p
+
+
+FEATURES = {}
+
+
+def feature(fn):
+    FEATURES[fn.__name__.replace('_', '-')] = fn
+    return fn
+
+
+def drive_one(st, name_):
+    if name_ not in FEATURES:
+        sys.exit(f'unknown feature {name_!r}; mapped: {", ".join(FEATURES)}')
+    name = next_name(st, name_)
+    j = Journey(st, name_, name)
+    j.url = clone(st, name.replace('-', '_'))
+    started = time.time()
+
+    async def go():
+        async with Session(st, j.url, 'owner', j) as o, Session(st, j.url, 'worker', j) as w:
+            await FEATURES[name_](j, o, w)
+    try:
+        asyncio.run(go())
+    except Exception:
+        j.check('journey ran to the end', False, traceback.format_exc())
+    j.transcript.close()
+    ok = all(c['ok'] for c in j.checks) and bool(j.checks)
+    result = {'feature': name_, 'run': st['run'], 'backend': st['backend'], 'store': shown(j.url), 'commit': _git('rev-parse', '--short', 'HEAD'),
+              'ok': ok, 'seconds': round(time.time() - started, 1), 'checks': j.checks}
+    (j.dir / 'result.json').write_text(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+    failed = [c for c in j.checks if not c['ok']]
+    print(f"{'PASS' if ok else 'FAIL'} {name_} [{st['backend']}] {len(j.checks) - len(failed)}/{len(j.checks)} checks · evidence {j.dir}")
+    for c in failed:
+        print(f"  FAILED {c['step']}: {c['check']}: {json.dumps(c.get('detail'), default=str)[:600]}")
+    return ok
+
+
+def drive(a):
+    st = state(run_dir(a.run))
+    sys.exit(0 if drive_one(st, a.feature) else 1)
+
+
+def drive_all(a):
+    st = state(run_dir(a.run))
+    results = {f: drive_one(st, f) for f in FEATURES}
+    out = pathlib.Path(st['dir']) / 'evidence' / f"all-{datetime.datetime.now():%Y%m%d-%H%M%S}.json"
+    out.write_text(json.dumps({'run': st['run'], 'backend': st['backend'], 'commit': _git('rev-parse', '--short', 'HEAD'), 'results': results}, indent=2))
+    print(f"{sum(results.values())}/{len(results)} journeys passed on {st['backend']} · summary {out}")
+    sys.exit(0 if all(results.values()) else 1)
+
+
+def call(a):
+    st = state(run_dir(a.run))
+    url = url_for(st, 'manual')
+    exists = (pathlib.Path(st['dir']) / 'db' / 'manual.db').exists() if st['backend'] == 'sqlite' else False
+    if st['backend'] == 'postgres':
+        with pg_admin(st) as c:
+            exists = bool(c.execute("SELECT 1 FROM pg_database WHERE datname = 'manual'").fetchone())
+    if not exists:
+        clone(st, 'manual')
+
+    async def go():
+        async with Session(st, url, a.role, None) as s:
+            return await s(a.tool, **json.loads(a.args))
+    print(json.dumps(asyncio.run(go()), indent=2, ensure_ascii=False))
+
+
+# ---------- journeys (one per file in .claude/skills/verify-apex-memory/features/) ----------
+
+@feature
+async def domain_discovery(j, o, w):
+    j.step = 'instructions'
+    j.check('owner instructions start with domain selection', o.instructions.startswith(
+        'At the start and when the subject of the work changes, call list_domains'), o.instructions[:200])
+    j.check('owner instructions carry the ask-once flow', all(p in o.instructions for p in ('ask the owner once', 'Not now', 'No knowledge base for <topic>')))
+    j.check("worker instructions say: report the gap", "report the gap to the owner's session" in w.instructions and 'create_domain' not in w.instructions)
+    j.step = 'list_domains'
+    r = await o('list_domains')
+    doms = {d['domain']: d for d in r.get('domains', [])}
+    j.check('three seeded domains', sorted(doms) == ['atlas', 'memory-ops', 'website'], sorted(doms))
+    j.check('descriptions name subject and limits', 'map API' in doms['atlas']['description'] and 'use atlas' in doms['website']['description'])
+    j.check('ops domain marked', doms['memory-ops']['ops'] is True and doms['atlas']['ops'] is False)
+    j.check('no global preferences yet', r.get('preferences') == [], r.get('preferences'))
+    j.step = 'answer yes: create_domain'
+    r = await o('create_domain', domain='tax-filing', title='Tax filing', description='Tax returns and their deadlines. Not for Atlas; use atlas.')
+    j.ok(r)
+    j.check('four start pages', r.get('pages') == ['tax-filing/index', 'tax-filing/status', 'tax-filing/log', 'tax-filing/decisions'], r)
+    r = await o('list_domains')
+    j.check('new domain listed with its description', any(d['domain'] == 'tax-filing' and d['description'].startswith('Tax returns') for d in r['domains']))
+    j.ok(await o('brief', domain='tax-filing'), 'brief of the new domain')
+    j.check('rows: 4 notes in tax-filing', j.rows("SELECT count(*) AS n FROM notes WHERE domain = 'tax-filing'")[0]['n'] == 4)
+    j.step = 'answer never: global preference'
+    r = await o('preference', action='add', text='No knowledge base for garden planning', owner_quote='no, never for this')
+    j.ok(r)
+    lst = await o('list_domains')
+    j.check('list_domains returns the never answer', {'id': r.get('item_id'), 'text': 'No knowledge base for garden planning'} in lst['preferences'], lst['preferences'])
+    j.check('worker sees it too', (await w('list_domains'))['preferences'] == lst['preferences'])
+    j.check('rows: preference without domain', j.rows('SELECT domain, owner_quote FROM preferences WHERE id = ?', r.get('item_id'))
+            == [{'domain': None, 'owner_quote': 'no, never for this'}])
+    j.step = 'domain preferences stay out of list_domains'
+    j.ok(await o('preference', action='add', text='Atlas only rule', owner_quote='only atlas', domain='atlas'))
+    j.check('domain preference not listed', all(p['text'] != 'Atlas only rule' for p in (await o('list_domains'))['preferences']))
+    j.step = 'worker cannot create or record'
+    j.refused(await w('create_domain', domain='worker-dom', title='W', description='Holds W.'), 'owner_only')
+    j.refused(await w('preference', action='add', text='No knowledge base for x', owner_quote='never'), 'owner_only')
+    j.check('rows: no worker domain', j.rows("SELECT count(*) AS n FROM notes WHERE domain = 'worker-dom'")[0]['n'] == 0)
+    j.check('rows: both refusals recorded in memory-ops', len(j.rows(
+        "SELECT id FROM events WHERE domain = 'memory-ops' AND op = 'tool:refused' AND actor = ?", WORKER)) == 2)
+
+
+@feature
+async def brief(j, o, w):
+    j.step = 'owner brief'
+    r = await o('brief', domain='atlas')
+    b = r.get('brief', '')
+    j.ok(r)
+    for part in ('domain atlas · you are verify-owner (owner)', 'check: 0 open problems', '| [[atlas/api]] | API contract of Atlas: rate limits and auth |',
+                 'accepted: D01, D02', 'proposed: P01', '- [#1 open] Write the API docs', '— SEED'):
+        j.check(f'brief shows {part!r}', part in b, b[:3000])
+    j.step = 'worker brief'
+    b = (await w('brief', domain='atlas'))['brief']
+    j.check('worker sees its working notes', f'===== your working notes\natlas/working/{WORKER}/draft' in b)
+    j.step = 'unknown domain'
+    r = await o('brief', domain='atlass')
+    j.refused(r, 'unknown_domain')
+    j.check('refusal lists the domains', r.get('domains') == ['atlas', 'memory-ops', 'website'], r)
+    j.step = 'CLI brief'
+    p = j.cli('brief', 'atlas')
+    j.check('CLI brief exits 0 with the index', p.returncode == 0 and '| [[atlas/api]] |' in p.stdout, p.stderr)
+
+
+@feature
+async def search(j, o, w):
+    j.step = 'bm25'
+    r = await o('search', query='rate limit requests per key', scope='atlas')
+    top = (r.get('hits') or [{}])[0]
+    j.check('top hit is the rate limits section', top.get('path') == 'atlas/api' and top.get('heading_path', [''])[-1] == 'Rate limits (2026-10-01)', r)
+    j.step = 'exact'
+    r = await o('search', query='9f3c2d1', mode='exact', scope='atlas')
+    j.check('exact finds the commit with a marked snippet', [h['path'] for h in r['hits']] == ['atlas/api'] and '[9f3c2d1]' in r['hits'][0]['snippet'], r)
+    r = await o('search', query='9f3c', mode='exact', scope='atlas')
+    j.check('exact matches whole words only', r['hits'] == [], r)
+    j.step = 'regex'
+    r = await o('search', query=r'\d+ requests per minute', mode='regex', scope='atlas')
+    j.check('regex finds the limit', [h['path'] for h in r['hits']] == ['atlas/api'], r)
+    j.refused(await o('search', query='(', mode='regex'), 'bad_regex')
+    j.refused(await o('search', query='x', mode='fuzzy'), 'bad_mode')
+    j.step = 'scope and working notes'
+    r = await o('search', query='website launch november')
+    j.check('no scope searches every domain', any(h.get('path') == 'website/launch' for h in r['hits']), r)
+    r = await o('search', query='zephyr')
+    j.check("another actor's working note is hidden", all('/working/' not in h.get('path', '') for h in r['hits']), r)
+    r = await o('search', query='zephyr', scope='atlas/working')
+    j.check('scope atlas/working shows it', any(h.get('path') == f'atlas/working/{WORKER}/draft' for h in r['hits']), r)
+    r = await w('search', query='zephyr')
+    j.check('its own actor sees it', any(h.get('path') == f'atlas/working/{WORKER}/draft' for h in r['hits']), r)
+    j.step = 'side effects'
+    j.check('rows: each search that ran is a tool event (8; refused ones are not)', len(j.rows("SELECT id FROM events WHERE op = 'tool:search'")) == 8)
+
+
+@feature
+async def read(j, o, w):
+    j.step = 'whole note'
+    r = await o('read', path='atlas/api')
+    j.ok(r)
+    j.check('content renders the note', '## Rate limits (2026-10-01)' in r['content'] and 'Tokens expire' in r['content'], r.get('content'))
+    j.check('outline: root and three headings', [x['heading_path'] for x in r['outline']] ==
+            [[], ['Atlas API'], ['Atlas API', 'Rate limits (2026-10-01)'], ['Atlas API', 'Auth']], r.get('outline'))
+    j.check('page header fields', (r['decision_status'], r['impl_status']) == ('agreed', 'built'), r)
+    j.step = 'one section'
+    r = await o('read', path='atlas/api', heading='Auth')
+    j.check('section content and version', r.get('content') == '\nTokens expire after 24 hours.\n' and r.get('version') == 1, r)
+    sid = r.get('section_id')
+    j.check('same section by id', (await o('read', section_id=sid)).get('content') == r.get('content'))
+    j.step = 'candidates'
+    r = await o('read', path='atlas/api', heading='Rate limits')
+    j.refused(r, 'not_found')
+    j.check('a heading without its date is a candidate', (r.get('candidates') or [{}])[0].get('heading_path') == ['Atlas API', 'Rate limits (2026-10-01)'], r)
+    r = await o('read', path='atlas/apii')
+    j.refused(r, 'not_found')
+    j.check('a near path is a candidate', 'atlas/api' in (r.get('candidates') or []), r)
+    j.refused(await o('read'), 'path_required')
+
+
+@feature
+async def patch_section(j, o, w):
+    j.step = 'replace'
+    r = await o('read', path='atlas/api', heading='Auth')
+    v, sid = r['version'], r['section_id']
+    out = await o('patch_section', op='replace', content=r['content'] + 'Refresh tokens last 30 days.\n', if_version=v, section_id=sid)
+    j.ok(out)
+    after = await o('read', section_id=sid)
+    j.check('replace changed the section and its version', 'Refresh tokens last 30 days.' in after['content'] and after['version'] == v + 1, after)
+    j.step = 'stale version'
+    r = await o('patch_section', op='replace', content='old view\n', if_version=v, section_id=sid)
+    j.refused(r, 'version_conflict')
+    j.check('conflict returns the current content', 'Refresh tokens' in r.get('content', '') and r.get('current_version') == v + 1, r)
+    j.step = 'append without version'
+    j.ok(await o('patch_section', op='append', content='Revoke a token with the admin console.', section_id=sid))
+    j.step = 'prepend'
+    j.refused(await o('patch_section', op='prepend', content='Note:', section_id=sid), 'version_required')
+    cur = (await o('read', section_id=sid))['version']
+    j.ok(await o('patch_section', op='prepend', content='All tokens are JWTs.', if_version=cur, section_id=sid))
+    c = (await o('read', section_id=sid))['content']
+    j.check('prepend first, append last', c.index('All tokens are JWTs.') < c.index('Tokens expire') < c.index('Revoke a token'), c)
+    j.step = 'replace_own_text keeps subsections'
+    top = await o('read', path='atlas/api', heading='Atlas API')
+    ids = [x['section_id'] for x in top['outline']]
+    j.refused(await o('patch_section', op='replace_own_text', content='## Sneaky heading\n', if_version=top['version'], section_id=top['section_id']),
+              'headings_not_allowed')
+    j.ok(await o('patch_section', op='replace_own_text', content='The Atlas API serves map tiles and geocoding.', if_version=top['version'],
+                 section_id=top['section_id'], summary='API contract of Atlas: tiles, geocoding, limits and auth'))
+    top2 = await o('read', path='atlas/api', heading='Atlas API')
+    j.check('own text changed, subsection ids kept', 'geocoding' in top2['content'] and [x['section_id'] for x in top2['outline']] == ids, top2)
+    j.check('summary is the new index line', '| [[atlas/api]] | API contract of Atlas: tiles, geocoding, limits and auth |' in (await o('read', path='atlas/index'))['content'])
+    j.step = 'side effects'
+    ev = j.rows("SELECT body FROM events WHERE op = 'tool:patch_section' ORDER BY id")
+    j.check('rows: five write events with their shape', len(ev) == 5 and all('"shape"' in e['body'] for e in ev), ev)
+    j.check('rows: two refusals recorded', len(j.rows("SELECT id FROM events WHERE domain = 'memory-ops' AND op = 'tool:refused'")) == 3)
+
+
+@feature
+async def create_note(j, o, w):
+    j.step = 'project note'
+    hdr = dict(decision_status='agreed', impl_status='planned', evidence='2026-10-31 — verify')
+    r = await o('create_note', path='atlas/limits-faq', title='Limits FAQ', summary='Answers about rate limits',
+                body='# Limits FAQ\n\nSee [[atlas/api#Auth]] for tokens.\n', **hdr)
+    j.ok(r)
+    j.check('catalog row added', '| [[atlas/limits-faq]] | Answers about rate limits |' in (await o('read', path='atlas/index'))['content'])
+    j.check('rows: link with anchor', j.rows("SELECT l.dst, l.anchor FROM links l JOIN sections s ON s.id = l.src_section WHERE s.note = 'atlas/limits-faq'")
+            == [{'dst': 'atlas/api', 'anchor': '#Auth'}])
+    j.step = 'refusals'
+    j.refused(await o('create_note', path='atlas/no-summary', title='X', body='x', **hdr), 'summary_required')
+    j.refused(await o('create_note', path='atlas/no-header', title='X', summary='x', body='x'), 'header_required')
+    j.refused(await o('create_note', path='atlas/limits-faq', title='Again', summary='x', body='x', **hdr), 'exists')
+    r = await o('create_note', path='atlas/broken', title='Broken', summary='x', body='See [[atlas/nowhere]].', **hdr)
+    j.refused(r, 'check_failed')
+    j.check('problem names the broken link', any('broken link [[atlas/nowhere]]' in p for p in r.get('problems', [])), r)
+    j.check('rows: refused notes do not exist', j.rows("SELECT path FROM notes WHERE path IN ('atlas/no-summary', 'atlas/no-header', 'atlas/broken')") == [])
+    j.step = 'working note'
+    j.ok(await o('create_note', path=f'atlas/working/{OWNER}/scratch', title='Scratch', body='Loose thoughts.'), 'working note needs no summary')
+    j.check('working note stays out of the index', 'working' not in (await o('read', path='atlas/index'))['content'])
+    j.ok(await o('check', domain='atlas'))
+    j.check('domain still has no problems', (await o('check', domain='atlas'))['problems'] == [])
+
+
+@feature
+async def batch(j, o, w):
+    hdr = dict(decision_status='agreed', impl_status='planned', evidence='2026-10-31 — verify')
+    j.step = 'single writes cannot link both ways'
+    r = await o('create_note', path='atlas/a', title='A', summary='a', body='Pairs with [[atlas/b]].', **hdr)
+    j.refused(r, 'check_failed')
+    j.step = 'batch'
+    r = await o('batch', ops=[
+        {'tool': 'create_note', 'args': dict(path='atlas/a', title='A', summary='Page A', body='Pairs with [[atlas/b]].', **hdr)},
+        {'tool': 'create_note', 'args': dict(path='atlas/b', title='B', summary='Page B', body='Pairs with [[atlas/a]].', **hdr)},
+        {'tool': 'log_append', 'args': dict(domain='atlas', op='LINKED PAIR', pages=['atlas/a', 'atlas/b'], source='verify', outcome='both pages')}])
+    j.ok(r)
+    j.check('a result per op', len(r.get('results', [])) == 3, r)
+    j.check('rows: both notes and the log entry', len(j.rows("SELECT path FROM notes WHERE path IN ('atlas/a', 'atlas/b')")) == 2
+            and len(j.rows("SELECT id FROM events WHERE domain = 'atlas' AND op = 'LINKED PAIR'")) == 1)
+    j.step = 'all or nothing'
+    r = await o('batch', ops=[
+        {'tool': 'create_note', 'args': dict(path='atlas/c', title='C', summary='Page C', body='c', **hdr)},
+        {'tool': 'create_note', 'args': dict(path='atlas/d', title='D', body='d', **hdr)}])
+    j.refused(r, 'summary_required')
+    j.check('refusal names the op', r.get('op_index') == 1 and r.get('tool') == 'create_note', r)
+    j.check('rows: the first op rolled back', j.rows("SELECT path FROM notes WHERE path = 'atlas/c'") == [])
+    j.refused(await o('batch', ops=[{'tool': 'move', 'args': {}}]), 'bad_batch')
+    j.check('batch refusals recorded once each', len(j.rows("SELECT id FROM events WHERE domain = 'memory-ops' AND op = 'tool:refused' AND refs LIKE '%batch%'")) == 2)
+
+
+@feature
+async def decisions(j, o, w):
+    j.step = 'accept a proposal'
+    j.ok(await o('set_decision_status', domain='atlas', id='P01', status='accepted'))
+    j.step = 'supersede'
+    j.refused(await o('set_decision_status', domain='atlas', id='D02', status='superseded', superseded_by='P99'), 'superseded_by_required')
+    j.ok(await o('set_decision_status', domain='atlas', id='D02', status='superseded', superseded_by='D01'))
+    j.step = 'void'
+    j.refused(await o('set_decision_status', domain='atlas', id='D01', status='void'), 'reason_required')
+    j.ok(await o('set_decision_status', domain='atlas', id='D01', status='void', reason='accepted by mistake in a demo'))
+    j.refused(await o('set_decision_status', domain='atlas', id='D01', status='accepted'), 'bad_transition')
+    rec = await o('read', path='atlas/decisions', heading='D01 — Cache tiles at the edge (2026-10-01)')
+    j.check('record stays, Status void, reason line added', '- **Status:** void' in rec.get('content', '') and '- **Void reason:** accepted by mistake in a demo' in rec.get('content', ''), rec)
+    b = (await o('brief', domain='atlas'))['brief']
+    j.check('brief lists decisions by status', all(x in b for x in ('accepted: P01', 'superseded: D02→D01', 'void: D01')), b[:2500])
+    j.step = 'records are append-only'
+    p = await o('read', path='atlas/decisions', heading='P01 — Vector tiles')
+    j.refused(await o('patch_section', op='replace', content='\n- **Status:** accepted\n', if_version=p['version'], section_id=p['section_id']), 'decision_overwritten')
+    j.refused(await o('patch_section', op='replace', content=p['content'].replace('accepted', 'proposed'), if_version=p['version'], section_id=p['section_id']),
+              'status_line_changed')
+    j.ok(await o('patch_section', op='append', content='- **Note:** shipped in v2.', section_id=p['section_id']), 'append to an accepted record')
+    j.step = 'worker'
+    j.refused(await w('set_decision_status', domain='atlas', id='P01', status='rejected'), 'owner_only')
+    j.step = 'side effects'
+    j.check('rows: derived decisions table', {r['id']: (r['status'], r['superseded_by']) for r in j.rows("SELECT id, status, superseded_by FROM decisions WHERE domain = 'atlas'")}
+            == {'D01': ('void', None), 'D02': ('superseded', 'D01'), 'P01': ('accepted', None)})
+
+
+@feature
+async def status_items(j, o, w):
+    j.step = 'add'
+    r = await o('status_item', domain='atlas', action='add', kind='blocker', text='Waiting for the map licence')
+    j.ok(r)
+    iid = r.get('item_id')
+    j.check('brief shows it', f'- [#{iid} blocker] Waiting for the map licence' in (await o('brief', domain='atlas'))['brief'])
+    j.check('status page renders it', '- Waiting for the map licence' in (await o('read', path='atlas/status'))['content'])
+    j.step = 'update'
+    j.ok(await o('status_item', domain='atlas', action='update', item_id=iid, text='Map licence signed; waiting for keys', kind='open'))
+    b = (await o('brief', domain='atlas'))['brief']
+    j.check('brief shows the new text and kind', f'- [#{iid} open] Map licence signed; waiting for keys' in b and 'Waiting for the map licence' not in b, b)
+    j.check('rows: event keeps the old text', 'Waiting for the map licence' in j.rows("SELECT body FROM events WHERE op = 'tool:status_item' ORDER BY id DESC")[0]['body'])
+    j.step = 'close'
+    j.ok(await o('status_item', domain='atlas', action='close', item_id=iid))
+    j.check('closed item leaves the brief', 'Map licence' not in (await o('brief', domain='atlas'))['brief'])
+    j.refused(await o('status_item', domain='atlas', action='close', item_id=iid), 'not_open')
+    j.check('rows: closed_at set', j.rows('SELECT closed_at FROM status_items WHERE id = ?', iid)[0]['closed_at'] is not None)
+    j.step = 'worker'
+    j.refused(await w('status_item', domain='atlas', action='add', kind='open', text='x'), 'owner_only')
+
+
+@feature
+async def roles(j, o, w):
+    hdr = dict(decision_status='agreed', impl_status='planned', evidence='2026-10-31 — verify')
+    j.step = 'worker writes its own working notes'
+    j.ok(await w('create_note', path=f'atlas/working/{WORKER}/notes', title='Notes', body='Worker notes.'))
+    d = await w('read', path=f'atlas/working/{WORKER}/draft', heading='Draft')
+    j.ok(await w('patch_section', op='append', content='More detail.', section_id=d['section_id']), 'worker appends to its draft')
+    j.ok(await w('log_append', domain='atlas', op='WORKER NOTE', pages=['atlas/api'], source='verify', outcome='workers may log'))
+    j.step = 'worker refused elsewhere'
+    j.refused(await w('create_note', path='atlas/worker-page', title='X', summary='x', body='x', **hdr), 'not_allowed')
+    a = await w('read', path='atlas/api', heading='Auth')
+    j.refused(await w('patch_section', op='append', content='x', section_id=a['section_id']), 'not_allowed')
+    j.refused(await w('create_note', path=f'atlas/working/{OWNER}/x', title='X', body='x'), 'not_allowed')
+    j.refused(await w('move', path=f'atlas/working/{WORKER}/draft', new_path='atlas/zephyr', summary='s', **hdr), 'owner_only')
+    j.step = 'owner promotes'
+    j.refused(await o('move', path=f'atlas/working/{WORKER}/draft', new_path='atlas/zephyr'), 'promotion_needs_summary_and_header')
+    r = await o('move', path=f'atlas/working/{WORKER}/draft', new_path='atlas/zephyr', summary='The zephyr cache idea', **hdr)
+    j.check('promoted', r.get('ok') and r.get('promoted') is True, r)
+    j.check('promoted note is in the index', '| [[atlas/zephyr]] | The zephyr cache idea |' in (await o('read', path='atlas/index'))['content'])
+    j.step = 'side effects'
+    j.check('rows: worker events carry its actor', len(j.rows("SELECT id FROM events WHERE actor = ? AND op LIKE 'tool:%' AND op != 'tool:refused'", WORKER)) >= 3)
+    j.check('rows: four worker refusals recorded', len(j.rows("SELECT id FROM events WHERE domain = 'memory-ops' AND op = 'tool:refused' AND actor = ?", WORKER)) == 4)
+
+
+@feature
+async def ops_refusals(j, o, w):
+    j.step = 'a refusal is recorded'
+    j.refused(await o('read', path='atlas/nowhere'), 'not_found')
+    ev = j.rows("SELECT refs, body, actor FROM events WHERE domain = 'memory-ops' AND op = 'tool:refused' ORDER BY id")
+    j.check('one record with tool and error', len(ev) == 1 and json.loads(ev[0]['refs']) == {'tool': 'read', 'error': 'not_found'} and ev[0]['actor'] == OWNER, ev)
+    j.step = 'content is redacted'
+    secret = 'SECRET-PARAGRAPH ' * 20
+    j.refused(await o('create_note', path='atlas/leak', title='Leak', summary='x', body=secret + '[[atlas/nowhere]]',
+                      decision_status='a', impl_status='b', evidence='2026-10-31 — v'), 'check_failed')
+    body = j.rows("SELECT body FROM events WHERE domain = 'memory-ops' AND op = 'tool:refused' ORDER BY id DESC")[0]['body']
+    j.check('body keeps the length, not the text', 'SECRET-PARAGRAPH' not in body and 'chars>' in body, body)
+    j.step = 'agents log friction'
+    j.ok(await o('log_append', domain='memory-ops', op='FRICTION: verify journey', pages=['memory-ops/log'], source='verify', outcome='logged'))
+    q = await o('log_query', domain='memory-ops', op='FRICTION')
+    j.check('log_query finds it', [e['op'] for e in q.get('entries', [])] == ['FRICTION: verify journey'], q)
+    q = await o('log_query', domain='memory-ops', include_tool=True)
+    j.check('include_tool shows the refusal records', sum(e['op'] == 'tool:refused' for e in q['entries']) == 2, q)
+    j.step = 'unknown pages'
+    j.refused(await o('log_append', domain='memory-ops', op='X', pages=['memory-ops/nope'], source='s', outcome='o'), 'unknown_pages')
+
+
+GARDEN = {'index.md': '# Garden index\n\nGarden notes for the verify journey.\n\n## Catalog\n\n| Page | Purpose |\n|---|---|\n| [[garden/beds]] | Raised beds |\n',
+          'beds.md': '# Raised beds\n\nThree beds, built in spring. See [[garden/index]].\n'}
+
+
+@feature
+async def store_admin(j, o, w):
+    j.step = 'check'
+    p = j.cli('check', 'atlas')
+    j.check('CLI check: no problems, exit 0', p.returncode == 0 and 'no problems found' in p.stdout, p.stdout + p.stderr)
+    j.step = 'import a folder of markdown'
+    folder = j.work / 'garden'
+    folder.mkdir()
+    for n, t in GARDEN.items():
+        (folder / n).write_text(t)
+    p = j.cli('import', folder)
+    j.check('import exits 0 with a report', p.returncode == 0 and '"domain": "garden"' in p.stdout, p.stdout + p.stderr)
+    p = j.cli('verify', folder)
+    j.check('verify: every page renders back identically', p.returncode == 0 and 'renders back identically' in p.stdout, p.stdout + p.stderr)
+    p = j.cli('import', folder)
+    j.check('a second import is refused', p.returncode != 0 and 'domain_exists' in p.stderr, p.stderr)
+    j.check('the agent can read the imported page', 'Three beds' in (await o('read', path='garden/beds')).get('content', ''))
+    j.step = 'backup'
+    p = j.cli('backup', '--to', j.work / 'backups', '--keep', '3')
+    path = pathlib.Path(p.stdout.strip())
+    j.check('backup writes a SQLite file', p.returncode == 0 and path.is_file(), p.stdout + p.stderr)
+    j.step = 'move the store: import the backup into a new store'
+    new = empty_store(j.st, j.name.replace('-', '_') + '_moved')
+    p = j.cli('import', path, url=new)
+    j.check('copy exits 0 with row counts', p.returncode == 0 and '"notes"' in p.stdout, p.stdout + p.stderr)
+    for dom in ('atlas', 'garden'):
+        a, b = j.cli('brief', dom), j.cli('brief', dom, url=new)
+        j.check(f'brief of {dom} is the same after the move (store line aside)',
+                a.returncode == b.returncode == 0 and a.stdout.split('\n', 1)[1] == b.stdout.split('\n', 1)[1], b.stdout[:400] + b.stderr)
+    src, dst = open_backend(j.url), open_backend(new)
+    try:
+        same = {t: (src.one(f'SELECT count(*) FROM {t}')[0], dst.one(f'SELECT count(*) FROM {t}')[0]) for t in ('notes', 'sections', 'links', 'decisions', 'preferences')}
+        sid = (src.one("SELECT value FROM meta WHERE key = 'store_id'")[0], dst.one("SELECT value FROM meta WHERE key = 'store_id'")[0])
+    finally:
+        src.close()
+        dst.close()
+    j.log({'compare': same, 'store_ids': sid})
+    j.check('rows: same counts in every table', all(x == y for x, y in same.values()), same)
+    j.check('store identity moves with it', sid[0] == sid[1], sid)
+    p = j.cli('import', path, url=new)
+    j.check('a second copy into the moved store is refused', p.returncode != 0 and 'copy into a new, empty store' in p.stderr, p.stderr)
+    other = empty_store(j.st, j.name.replace('-', '_') + '_other')
+    j.cli('import', folder, url=other)
+    p = j.cli('import', path, url=other)
+    j.check('a copy into another store that holds knowledge is refused', p.returncode != 0 and 'already holds knowledge' in p.stderr, p.stderr)
+
+
+# ---------- main ----------
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest='cmd', required=True)
+    for name in ('launch', 'doctor', 'features', 'drive', 'all', 'call', 'cleanup'):
+        sp = sub.add_parser(name)
+        sp.add_argument('--run', help='run name (default: the latest launched run)')
+        if name == 'launch':
+            sp.add_argument('--backend', choices=['sqlite', 'postgres'], default='sqlite')
+        if name == 'drive':
+            sp.add_argument('feature')
+        if name == 'call':
+            sp.add_argument('tool', choices=TOOLS)
+            sp.add_argument('args', nargs='?', default='{}', help='JSON object of tool arguments')
+            sp.add_argument('--role', choices=['owner', 'worker'], default='owner')
+    a = p.parse_args()
+    if a.cmd == 'features':
+        print('\n'.join(FEATURES))
+        return
+    {'launch': launch, 'doctor': doctor, 'drive': drive, 'all': drive_all, 'call': call, 'cleanup': cleanup}[a.cmd](a)
+
+
+if __name__ == '__main__':
+    main()

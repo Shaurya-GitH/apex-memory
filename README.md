@@ -31,6 +31,7 @@ The project started as a part of a private project. This repository is the publi
 - [Backups](#backups)
 - [Differences between the backends](#differences-between-the-backends)
 - [Run the tests](#run-the-tests)
+- [Verify a change](#verify-a-change)
 - [Add a database backend](#add-a-database-backend)
 - [Agent rules template](#agent-rules-template)
 - [License](#license)
@@ -679,6 +680,46 @@ The store compiles each `regex` pattern in Python first. Then it sends the patte
    ```
 
 6. Remove the server: `docker rm -f apex-memory-test-pg`.
+
+## Verify a change
+
+The unit tests do a check of the store. The verification harness does a check of the full path that an agent uses: the MCP stdio server, the CLI, and SQLite or Postgres. Use it before you say that a change works. Any agent can use it: Claude Code, Codex, Cursor or a person in a shell.
+
+- The harness is [scripts/verify](scripts/verify).
+- The procedure is [.claude/skills/verify-apex-memory/SKILL.md](.claude/skills/verify-apex-memory/SKILL.md). The folders `.cursor/skills/` and `.agents/skills/` contain a link to the same skill.
+- The feature map is [.claude/skills/verify-apex-memory/features/](.claude/skills/verify-apex-memory/features/README.md). It has one file for each feature, with the steps and the result that proves each step.
+
+Each run has its own folder `.verify/<run>/`, with its own `HOME` and its own databases. The harness does not open your real store. The Postgres run starts its own Docker container.
+
+1. Start a run. For Postgres, use `--backend postgres`. Docker must be available.
+
+   ```sh
+   uv run --extra postgres scripts/verify launch --backend sqlite
+   ```
+
+2. Make sure that the run is correct. The result must start with `OK`.
+
+   ```sh
+   uv run --extra postgres scripts/verify doctor
+   ```
+
+3. Run the journey of one feature, or all journeys:
+
+   ```sh
+   uv run --extra postgres scripts/verify drive domain-discovery
+   uv run --extra postgres scripts/verify all
+   ```
+
+4. Read the evidence in `.verify/<run>/evidence/<feature>-<n>/`. `transcript.jsonl` has each call and its result. `result.json` has each check.
+5. Remove the run. The evidence stays.
+
+   ```sh
+   uv run --extra postgres scripts/verify cleanup
+   ```
+
+Use `uv run --extra postgres`. A plain `uv run` removes the Postgres driver from the environment.
+
+If you add or change a feature, add or change its journey in `scripts/verify` and its file in the feature map.
 
 ## Add a database backend
 
