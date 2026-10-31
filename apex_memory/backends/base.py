@@ -45,7 +45,8 @@ class Backend(abc.ABC):
 
     @abc.abstractmethod
     def regex(self, expr: str) -> str:
-        """A condition that is true when `expr` matches the regular expression given as the next '?' argument."""
+        """A condition that is true when `expr` matches the regular expression given as the next '?' argument.
+        A query with a pattern that the database refuses raises re.error."""
 
     @abc.abstractmethod
     def prefix(self, expr: str) -> str:

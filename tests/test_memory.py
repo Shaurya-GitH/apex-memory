@@ -1228,6 +1228,11 @@ class MemoryTest(unittest.TestCase):
 
 @unittest.skipUnless(PG_URL, 'set APEX_MEMORY_TEST_POSTGRES_URL to run the tests on Postgres')
 class PostgresMemoryTest(MemoryTest):
+    def test_regex_that_postgres_rejects_is_bad_regex(self):
+        # e2e (search eval): '[^\n]{0,1200}' compiles in Python, but Postgres allows at most 255 repetitions.
+        self.refused('bad_regex', self.s.search, r'Detailed[^\n]{0,1200}', mode='regex', scope='demo')
+        self.assertEqual(len(self.s.search(r'Detailed[^\n]{0,200}', mode='regex', scope='demo')['hits']), 1)
+
     def test_diacritic_upgrade_reindexes_the_resolved_store_schema(self):
         from apex_memory.backends.base import SQL
         url = self.new_url('upgrade')

@@ -587,11 +587,11 @@ class Store:
                 texts.append(f"{r['op']} {r['body'] or ''}")
         elif mode in ('exact', 'regex'):
             if mode == 'regex':
-                try:
+                try:  # the database can refuse a pattern that Python compiles (e.g. Postgres: at most 255 repetitions)
                     rx = re.compile(query, re.M)
+                    rows = self._q(f'SELECT t.* FROM sections t WHERE {self.db.regex("t.body")} AND {inscope.format("note")}', query, *args)
                 except re.error as e:
                     raise Refused('bad_regex', detail=str(e))
-                rows = self._q(f'SELECT t.* FROM sections t WHERE {self.db.regex("t.body")} AND {inscope.format("note")}', query, *args)
             else:  # whole words: the text around the query is not a letter or digit where the query starts or ends with one
                 rx = re.compile(('(?<![^\\W_])' if query[:1].isalnum() else '') + re.escape(query) + ('(?![^\\W_])' if query[-1:].isalnum() else ''), re.I)
                 rows = [r for r in self.db.search('sections', query, inscope.format('note'), args, exact=True) if rx.search(r['body'])]

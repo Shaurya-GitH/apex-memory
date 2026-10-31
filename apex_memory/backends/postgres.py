@@ -71,7 +71,10 @@ class PostgresBackend(Backend):
             yield
 
     def _run(self, sql, args):
-        return self.db.execute(_sql(sql), args) if args else self.db.execute(sql)
+        try:
+            return self.db.execute(_sql(sql), args) if args else self.db.execute(sql)
+        except psycopg.errors.InvalidRegularExpression as e:  # the contract of regex(): a refused pattern is re.error
+            raise re.error(str(e).strip()) from None
 
     def query(self, sql, args=()):
         return self._run(sql, args).fetchall()

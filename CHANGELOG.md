@@ -21,6 +21,7 @@ Fixes from 16 days of real use (12 to 28 October 2026): about 60 refusals and 17
 - `status_item` action `update` changes the text, and as an option the kind, of an open item.
 - `read` and other tools that find a heading give `candidates` when they cannot find it, also for a heading without
   its date. An unknown path gives the nearest note paths. `read` without a path gives `path_required`.
+- On Postgres, a `regex` pattern that Postgres refuses, for example a repetition count above 255, gets `bad_regex`.
 - Search: `bm25` ranks hits that have more of the query words higher and has a relevance floor. `exact` finds full
   words only. Snippets start and stop at the end of a word.
 - Write events record the shape of each write (characters, lines, headings, sections created, changed and removed,

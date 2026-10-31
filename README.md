@@ -469,7 +469,7 @@ A refusal is an expected result. It is not an error of the server. The `error` f
 | `generated_section` | The store makes the section from rows. | Use `status_item`, `log_append` or the `summary` field. |
 | `status_line_changed`, `decision_overwritten`, `decision_removed` | The edit changes a decision record in a way that is not permitted. | Use `set_decision_status`, or append text only. |
 | `unknown_pages` | `log_append` names a page that is not in the store. | Name pages that exist. |
-| `bad_regex` | The pattern does not compile in Python. | Correct the pattern. |
+| `bad_regex` | The pattern does not compile in Python, or Postgres refuses it. | Correct the pattern. |
 | `headings_not_allowed` | `prepend` or `replace_own_text` text contains a heading, or a write puts a heading in the text before the first heading of a note that has other sections. | Use `append` to add subsections. |
 | `bad_transition` | `set_decision_status` asks for a change that the life cycle does not permit, for example accepted to proposed. | Use proposed to accepted, rejected or superseded, or accepted to superseded or void. |
 | `reason_required` | `set_decision_status` to `void` has no `reason`. | Give the reason why the acceptance was an error. |
