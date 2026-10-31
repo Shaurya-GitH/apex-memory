@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 — 2026-11-01
+
+- Domain selection: usually one domain agrees with the work. The agent uses a second domain only when the task has an
+  explicit dependency on it. The server instructions, `templates/AGENTS.md` and the README give this rule. In a test
+  on 75 real tasks, the rule removed most of the unnecessary second domains.
+
 ## 0.2.0 — 2026-10-31
 
 Fixes from 16 days of real use (12 to 28 October 2026): about 60 refusals and 17 agent reports.
