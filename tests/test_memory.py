@@ -445,6 +445,22 @@ class MemoryTest(unittest.TestCase):
         self.assertNotIn('[[demo/index]]', self.s.render_note('demo/index'))  # the index is not a row of its own catalog
         self.assertEqual(self.s.list_domains()['domains'][0]['description'], 'The demo: a fixture domain for the tests.')
 
+    def test_replace_own_text_unchanged_sets_only_the_summary(self):
+        # e2e (README "Keep the description current"): the own text resent unchanged must leave the page as it is,
+        # also where it is empty or not in the store's blank-line form. heading=[] is never generated.
+        self.s.create_domain('newdom', 'New domain', 'Holds X.')
+        self.s.create_note('demo/loose', 'Loose', 'loose', 'x', 'a', 'b', '2026-10-31 — t')
+        root = self.s._one("SELECT id FROM sections WHERE note = 'demo/loose' AND heading_path = '[]'")[0]
+        with self.s._write():
+            self.s.db.execute('UPDATE sections SET body = ? WHERE id = ?', ('Text without blank lines.\n', root))  # as an import can keep it
+        for path in ('newdom/index', 'demo/index', 'demo/loose'):
+            before = self.s.render_note(path, frontmatter=False)
+            r = self.s.read(path, heading=[])
+            out = self.s.patch_section('replace_own_text', r['content'], r['version'], section_id=r['section_id'], summary=f'{path} described.')
+            self.assertEqual((out['changed'], self.s.render_note(path, frontmatter=False)), (False, before), path)
+            self.assertEqual(self.s._note(path)['summary'], f'{path} described.')
+        self.assertNotIn(self.no_desc('demo'), self.s.check('demo')['problems'])
+
     def test_void_an_accepted_decision(self):
         # Real case (memory-ops events 829-833): a mistaken acceptance could not be undone honestly.
         self.refused('reason_required', self.s.set_decision_status, 'demo', 'D02', 'void')

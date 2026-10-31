@@ -280,7 +280,7 @@ create_domain(
 
 To use a different name for the ops domain, give `--ops-domain <name>` to `apex-memory serve`.
 
-Keep the description current. When the scope of a domain changes, change the summary of `<domain>/index`. Use `patch_section` with `summary` on a section of the index. For example, use `op: "replace_own_text"` on the first heading of the index, with its own text unchanged.
+Keep the description current. When the scope of a domain changes, change the summary of `<domain>/index`. Use `patch_section` with `summary` and `op: "replace_own_text"` on the text before the first heading of the index (`heading=[]`). For `content`, give the `content` that `read` gives for `heading=[]`. If the own text does not change, the page does not change. Do not use the first heading of an imported index: it can hold the generated catalog, and the store then refuses the write with `generated_section`.
 
 A domain that you imported from markdown has no description. `list_domains` then shows the first paragraph of its index, with `description_missing: true`. The check shows the problem until you give a summary to the index.
 

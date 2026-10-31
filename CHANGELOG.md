@@ -4,6 +4,8 @@
 
 Fixes from 16 days of real use (12 to 28 October 2026): about 60 refusals and 17 agent reports.
 
+- `replace_own_text` with the own text unchanged does not change the page. Use it with `summary` on `heading=[]` to
+  change only the summary.
 - `patch_section` `append` does not need `if_version`. The store does not compare it. `replace`, `prepend` and
   `replace_own_text` without `if_version` get the refusal `version_required`.
 - New tool `batch`: a list of writes in one transaction, all or nothing. The check runs one time, after the last

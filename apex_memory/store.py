@@ -686,6 +686,8 @@ class Store:
                     raise Refused('headings_not_allowed', hint=f'{op} changes only the own text; use append for subsections')
                 if op == 'prepend':
                     new = '\n' + content.strip('\n') + '\n\n' + current.lstrip('\n')
+                elif content.strip() == t['body'].strip():  # own text resent unchanged (e.g. to set only the summary): keep it
+                    new = t['body']
                 else:
                     new = '\n' + content.strip('\n') + '\n\n' if content.strip() else '\n'
             records = {r['id']: r for r in self._records(domain)} if t['note'] == f'{domain}/decisions' else None
