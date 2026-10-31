@@ -49,5 +49,6 @@ Keep implementation details out of the map. Name only user paths, stable handles
 - [Roles](./roles.md): worker limits, owner promotion of a working note.
 - [Refusals in the ops domain](./ops-refusals.md): automatic records, redaction, friction log.
 - [Store administration](./store-admin.md): CLI check, markdown import and verify, backup, move a store.
+- [Upgrade](./upgrade.md): v0.1.0 to this branch with `uv tool upgrade`, safety backup, status, restore and roll back.
 
 Not mapped yet: `links`, `log_query` filters beyond op, `lease`, `source`, `patch_header`.

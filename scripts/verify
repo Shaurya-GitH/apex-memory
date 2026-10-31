@@ -260,16 +260,16 @@ def _git(*args):
 class Session:
     """One MCP stdio server (apex-memory serve) and a client session to it, as an agent's MCP client runs it."""
 
-    def __init__(self, st, url, role, journey):
-        self.st, self.url, self.role, self.j = st, url, role, journey
+    def __init__(self, st, url, role, journey, exe=None, env=None):
+        self.st, self.url, self.role, self.j, self.exe, self.env = st, url, role, journey, exe or apex_bin(), env or env_for(st)
         self.actor = OWNER if role == 'owner' else WORKER
 
     async def __aenter__(self):
         from mcp.client.session import ClientSession
         from mcp.client.stdio import StdioServerParameters, stdio_client
         self.stack = contextlib.AsyncExitStack()
-        params = StdioServerParameters(command=apex_bin(), args=['serve', '--url', self.url, '--actor', self.actor, '--role', self.role],
-                                       env=env_for(self.st), cwd=self.st['dir'])
+        params = StdioServerParameters(command=self.exe, args=['serve', '--url', self.url, '--actor', self.actor, '--role', self.role],
+                                       env=self.env, cwd=self.st['dir'])
         r, w = await self.stack.enter_async_context(stdio_client(params, errlog=open(os.devnull, 'w')))
         self.session = await self.stack.enter_async_context(ClientSession(r, w))
         self.instructions = (await self.session.initialize()).instructions
@@ -314,9 +314,14 @@ class Journey:
     def ok(self, out, what='ok'):
         return self.check(what, out.get('ok') is True, out)
 
-    def rows(self, sql, *args):
+    def run(self, *cmd, env=None):
+        p = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, env=env or env_for(self.st), cwd=self.work)
+        self.log({'cmd': [str(c) for c in cmd], 'exit': p.returncode, 'stdout': p.stdout[-4000:], 'stderr': p.stderr[-4000:]})
+        return p
+
+    def rows(self, sql, *args, url=None):
         """Side effects, read straight from the database (not through the tools)."""
-        db = open_backend(self.url)
+        db = open_backend(url or self.url)
         try:
             out = [dict(r) for r in db.query(sql, args)]
         finally:
@@ -324,9 +329,9 @@ class Journey:
         self.log({'db': sql, 'args': args, 'rows': out})
         return out
 
-    def cli(self, *args, url=None):
-        cmd = [apex_bin(), *[str(x) for x in args]] + (['--url', url or self.url] if url is not False else [])
-        p = subprocess.run(cmd, capture_output=True, text=True, env=env_for(self.st), cwd=self.work)
+    def cli(self, *args, url=None, exe=None, env=None):
+        cmd = [exe or apex_bin(), *[str(x) for x in args]] + (['--url', url or self.url] if url is not False else [])
+        p = subprocess.run(cmd, capture_output=True, text=True, env=env or env_for(self.st), cwd=self.work)
         self.log({'cli': [shown(c) for c in cmd[1:]], 'exit': p.returncode, 'stdout': p.stdout[-4000:], 'stderr': p.stderr[-4000:]})
         return p
 
@@ -746,6 +751,97 @@ async def store_admin(j, o, w):
     j.cli('import', folder, url=other)
     p = j.cli('import', path, url=other)
     j.check('a copy into another store that holds knowledge is refused', p.returncode != 0 and 'already holds knowledge' in p.stderr, p.stderr)
+
+
+OPS_FOLDER = {'index.md': '# Memory ops index\n\nFailures and friction of the memory system itself.\n', 'log.md': '# Memory ops log\n'}
+
+
+@feature
+async def upgrade(j, o, w):
+    """v0.1.0 from a git remote, knowledge written by it, `uv tool upgrade` to this branch's HEAD commit, then proof."""
+    tools = j.work / 'uv'
+    env = env_for(j.st) | {'UV_TOOL_DIR': str(tools / 'tools'), 'UV_TOOL_BIN_DIR': str(tools / 'bin')}
+    exe = tools / 'bin' / 'apex-memory'
+    remote = j.work / 'remote.git'
+    head = _git('rev-parse', 'HEAD')
+    j.step = 'install v0.1.0 from a git remote'
+    j.run('git', 'clone', '-q', '--bare', REPO, remote)
+    j.run('git', '-C', remote, 'update-ref', 'refs/heads/main', 'v0.1.0')
+    j.run('git', '-C', remote, 'symbolic-ref', 'HEAD', 'refs/heads/main')
+    p = j.run('uv', 'tool', 'install', '-q', f'apex-memory[postgres] @ git+file://{remote}', env=env)
+    j.check('uv tool install exits 0', p.returncode == 0, p.stderr)
+    p = j.cli('--help', url=False, exe=exe, env=env)
+    j.check('the installed CLI is the old one (no status command)', p.returncode == 0 and 'status' not in p.stdout, p.stdout)
+    j.step = 'the old version writes knowledge'
+    url = empty_store(j.st, j.name.replace('-', '_') + '_store')
+    j.url = url
+    for dom, files in (('garden', GARDEN), ('memory-ops', OPS_FOLDER)):
+        d = j.work / dom
+        d.mkdir()
+        for n, t in files.items():
+            (d / n).write_text(t)
+        p = j.cli('import', d, url=url, exe=exe, env=env)
+        j.check(f'old import of {dom} exits 0', p.returncode == 0, p.stderr)
+    hdr = dict(decision_status='agreed', impl_status='planned', evidence='2026-10-31 — verify upgrade')
+    async with Session(j.st, url, 'owner', j, exe=str(exe), env=env) as old:
+        j.ok(await old('create_note', path='garden/compost', title='Compost', summary='The compost plan', body='# Compost\n\nTurn it weekly. See [[garden/beds]].\n', **hdr))
+        r = await old('read', path='garden/beds', heading='Raised beds')
+        j.ok(await old('patch_section', op='append', content='Beds are 1.2 m wide.', if_version=r['version'], section_id=r['section_id']))
+        j.ok(await old('log_append', domain='garden', op='PLAN COMPOST', pages=['garden/compost'], source='verify', outcome='planned'))
+        paths = [x['path'] for x in j.rows('SELECT path FROM notes ORDER BY path')]
+        before = {p_: (await old('read', path=p_))['content'] for p_ in paths if not p_.startswith('memory-ops/')}
+    db = open_backend(url)
+    v_old = db.schema_version()
+    db.close()
+    j.step = 'upgrade with uv tool upgrade'
+    j.run('git', '-C', remote, 'fetch', '-q', REPO, f'{head}:refs/heads/main', '--update-head-ok')
+    p = j.run('uv', 'tool', 'upgrade', 'apex-memory', env=env)
+    j.check('uv tool upgrade exits 0 and names the branch commit', p.returncode == 0 and head[:7] in (p.stdout + p.stderr), p.stdout + p.stderr)
+    p = j.cli('--version', url=False, exe=exe, env=env)
+    j.check('the upgraded CLI reports this checkout\'s version', p.stdout.strip() == f"apex-memory {j.st['version']}", p.stdout + p.stderr)
+    j.step = 'status before the first open'
+    p = j.cli('status', url=url, exe=exe, env=env)
+    j.check('status shows the pending migrations', p.returncode == 0 and 'pending migration' in p.stdout and 'last backup: none' in p.stdout, p.stdout + p.stderr)
+    db = open_backend(url)
+    j.check('status changed nothing', db.schema_version() == v_old, db.schema_version())
+    known = len(db.migrations())
+    db.close()
+    j.step = 'the MCP client restarts on the new server'
+    async with Session(j.st, url, 'owner', j, exe=str(exe), env=env) as new:
+        after = {p_: (await new('read', path=p_))['content'] for p_ in before}
+        j.check('every page renders the same', after == before, {p_: (before[p_], after.get(p_)) for p_ in before if after.get(p_) != before[p_]})
+        j.check('the new tools are there', (await new('list_domains')).get('ok') is True)
+    db = open_backend(url)
+    j.check('schema migrated', db.schema_version() == known, db.schema_version())
+    db.close()
+    j.step = 'the safety backup'
+    safety = (pathlib.Path(j.st['dir']) / 'db' / 'backups') if j.st['backend'] == 'sqlite' else (pathlib.Path(j.st['dir']) / 'home' / '.apex-memory' / 'backups')
+    found = sorted(safety.glob(f'pre-migration-*-v{v_old}-to-v{known}.db'))
+    j.check(f'one pre-migration backup in the default folder {safety}', len(found) == 1, [str(f) for f in safety.glob('*')] if safety.is_dir() else 'missing')
+    ev = j.rows("SELECT op, refs FROM events WHERE domain = 'memory-ops' AND op LIKE 'MIGRATION%'")
+    j.check('the ops domain logs the migration with the backup path', len(ev) == 1 and found and json.loads(ev[0]['refs']) == {'from': v_old, 'to': known, 'backup': str(found[0])}, ev)
+    p = j.cli('status', url=url, exe=exe, env=env)
+    j.check('status: up to date, last backup is the safety backup', 'up to date' in p.stdout and found and f'last backup: {found[0]}' in p.stdout, p.stdout + p.stderr)
+    if not found:
+        return
+    j.step = 'the backup restores (new version)'
+    restored = empty_store(j.st, j.name.replace('-', '_') + '_restored')
+    p = j.cli('import', found[0], url=restored, exe=exe, env=env)
+    j.check('import of the backup exits 0', p.returncode == 0, p.stderr)
+    async with Session(j.st, restored, 'owner', j, exe=str(exe), env=env) as s:
+        got = {p_: (await s('read', path=p_))['content'] for p_ in before}
+    j.check('restored pages are the pre-upgrade pages', got == before)
+    j.step = 'roll back: v0.1.0 again, restore the backup'
+    p = j.run('uv', 'tool', 'install', '-q', f'apex-memory[postgres] @ git+file://{remote}@v0.1.0', env=env)
+    j.check('reinstall of the v0.1.0 tag exits 0', p.returncode == 0, p.stderr)
+    rolled = empty_store(j.st, j.name.replace('-', '_') + '_rolled')
+    p = j.cli('import', found[0], url=rolled, exe=exe, env=env)
+    j.check('the old version imports the backup', p.returncode == 0, p.stderr)
+    async with Session(j.st, rolled, 'owner', j, exe=str(exe), env=env) as s:
+        got = {p_: (await s('read', path=p_))['content'] for p_ in before}
+    j.check('the old version reads the pre-upgrade pages', got == before)
+    p = j.cli('brief', 'garden', url=url, exe=exe, env=env)
+    j.check('the old version refuses the migrated store and says to upgrade', p.returncode != 0 and 'upgrade' in p.stderr, p.stderr)
 
 
 # ---------- main ----------

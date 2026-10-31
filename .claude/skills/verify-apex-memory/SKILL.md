@@ -48,6 +48,7 @@ uv run --extra postgres scripts/verify call <tool> '<json args>' [--role worker]
 - `drive` starts two MCP servers on a fresh clone: `apex-memory serve --actor verify-owner --role owner` and `--actor verify-worker --role worker`. It runs the journey in the feature's file, then prints `PASS|FAIL <feature> [<backend>] n/m checks · evidence <dir>` and each failed check with its detail.
 - `call` is for manual driving: one tool call over MCP on the run's `manual` store (a clone of the seed made on first use; it keeps your changes across calls). Example: `scripts/verify call read '{"path": "atlas/api", "heading": "Auth"}'`.
 - A refusal comes back as a normal tool result `{"ok": false, "error": "<code>", ...}`; the journeys assert the code, not the text.
+- `drive upgrade` installs v0.1.0 and upgrades to the committed `HEAD` with `uv tool upgrade` in a scratch uv tool folder. Commit before you run it.
 - To drive a new behaviour, add a journey function decorated with `@feature` in `scripts/verify` and a matching file in `features/`.
 
 ## Evidence
