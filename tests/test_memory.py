@@ -296,6 +296,42 @@ class MemoryTest(unittest.TestCase):
         e = self.s._one("SELECT * FROM events WHERE op = 'tool:patch_section'")
         self.assertEqual((json.loads(e['body'])['before'], e['actor'], e['task_id'], e['run_id']), (r['content'], 'test', 'T1', self.s.run_id))
 
+    # ----- smarter checks -----
+
+    PARA = 'This paragraph is long enough to count as a claim for the duplicate check of the store, because it has more than two hundred characters of text in it, and it was pasted into several notes of one domain. '
+
+    def test_removing_one_copy_of_a_duplicate_is_allowed(self):
+        # Real case (memory-ops event 291): de-duplicating a paragraph pasted into 10 pages was refused step by step.
+        self.import_extra('dup', {'index.md': '# Dup\n\n## Catalog\n\n| [[dup/a]] | a |\n| [[dup/b]] | b |\n| [[dup/c]] | c |\n| [[dup/d]] | d |\n',
+                                  **{f'{n}.md': f'# {n.upper()}\n\n{self.PARA}\n' for n in 'abc'}, 'd.md': '# D\n\nOther text.\n'})
+        self.assertEqual(len(self.s.check('dup')['problems']), 1)
+        a = self.s.read('dup/a', heading='A')
+        self.assertTrue(self.s.patch_section('replace', '\nSee [[dup/c]].\n', a['version'], section_id=a['section_id'])['ok'])
+        self.assertIn('same paragraph in dup/b, dup/c:', self.s.check('dup')['problems'][0])
+        d = self.s.read('dup/d', heading='D')
+        self.refused('check_failed', self.s.patch_section, 'append', self.PARA, section_id=d['section_id'])  # one more copy
+        self.assertTrue(self.s.patch_section('append', self.PARA.replace('long', 'very long'), section_id=a['section_id'])['ok'])  # one copy
+        self.refused('check_failed', self.s.patch_section, 'append', self.PARA.replace('long', 'very long'), section_id=d['section_id'])  # a new duplicate
+        b = self.s.read('dup/b', heading='B')
+        self.assertTrue(self.s.patch_section('replace', '\nSee [[dup/c]].\n', b['version'], section_id=b['section_id'])['ok'])
+        self.assertEqual(self.s.check('dup')['problems'], [])
+
+    def test_root_only_page_gets_headings(self):
+        # Real case (memory-ops events 984-995): a page whose only section is the root could not get any heading.
+        self.s.create_note('demo/flat', 'Flat', 'a page without headings', 'Only text.\n', 'a', 'b', '2026-10-24 — t')
+        root = self.s.read('demo/flat')['outline'][0]
+        out = self.s.patch_section('append', '# Area one\n\nFacts.\n\n## Detail\n\nMore.', section_id=root['section_id'])
+        self.assertTrue(out['ok'])
+        r = self.s.read('demo/flat')
+        self.assertEqual([o['heading_path'] for o in r['outline']], [[], ['Area one'], ['Area one', 'Detail']])
+        self.assertIn('Only text.\n\n# Area one\n\nFacts.\n\n## Detail\n\nMore.', r['content'])
+        self.assertEqual(self.s.read('demo/flat', heading='Detail')['content'], '\nMore.\n\n')
+        self.refused('headings_not_allowed', self.s.patch_section, 'append', '# Area two', section_id=root['section_id'])  # no longer root-only
+        self.s.create_note('demo/flat2', 'Flat 2', 'another', 'Text.\n', 'a', 'b', '2026-10-24 — t')
+        root2 = self.s.read('demo/flat2')['outline'][0]
+        self.s.patch_section('replace', '\nNew text.\n\n# Part\n\nBody.\n', root2['version'], section_id=root2['section_id'])
+        self.assertEqual([o['heading_path'] for o in self.s.read('demo/flat2')['outline']], [[], ['Part']])
+
     # ----- batch -----
 
     def test_batch_writes_cross_linked_pages(self):
@@ -679,9 +715,13 @@ class MemoryTest(unittest.TestCase):
         self.assertLess(log.index('— SECOND'), log.index('— THIRD'))
         self.s.create_note('legacy/new', 'New', 'a new legacy note', '# New\n', 'a', 'b', '2026-10-12 — t')
         self.assertIn('[[legacy/new]] a new legacy note', self.s.brief('legacy')['brief'])
+        # Real case (memory-ops event 199): the first Status line made every older record a new problem.
         d1 = self.s.read('legacy/decisions', heading='D1 — First, 2026-09-13')
-        info = self.refused('check_failed', self.s.patch_section, 'append', '- **Status:** accepted', d1['version'], section_id=d1['section_id'])
-        self.assertIn("decision D2 needs exactly one '- **Status:**' line (has 0)", info['problems'])  # adopting the rule covers every record
+        self.assertTrue(self.s.patch_section('append', '- **Status:** accepted', section_id=d1['section_id'])['ok'])
+        self.assertEqual(self.s.check('legacy')['problems'], ["decision D2 needs exactly one '- **Status:**' line (has 0)"])  # existing debt
+        top = self.s.read('legacy/decisions', heading='Decisions')
+        info = self.refused('check_failed', self.s.patch_section, 'append', '# D3 — Third, 2026-10-12\n\nNo status line.', section_id=top['section_id'])
+        self.assertEqual(info['problems'], ["decision D3 needs exactly one '- **Status:**' line (has 0)"])  # a new record is checked
 
     def test_import_resolves_links_from_other_domains_and_empty_anchors(self):
         self.import_extra('first', {'index.md': '# First\n\n## Catalog\n\n| [[first/page]] | p |\n',

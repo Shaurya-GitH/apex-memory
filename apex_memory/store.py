@@ -209,10 +209,11 @@ class Store:
             return {'ok': True, **result}
 
     def _check_state(self, domains):
-        return {p for d in domains for p in self.problems(d)}
+        return {key: (text, n, shown) for d in domains for key, text, n, shown in self._problems(d)}
 
     def _refuse_new(self, before, domains):
-        new = sorted(self._check_state(domains) - before)
+        new = sorted(text for key, (text, n, shown) in self._check_state(domains).items()
+                     if shown and (key not in before or n > before[key][1]))
         if new:
             raise Refused('check_failed', problems=new)
 
@@ -443,7 +444,13 @@ class Store:
     # ----- check -----
 
     def problems(self, domain):
-        p, domains = [], self._domains()
+        return [text for _, text, _, shown in self._problems(domain) if shown]
+
+    def _problems(self, domain):
+        """Every problem as (key, text, count, shown). A write is refused when a shown problem is new: its key was
+        not there before, or its count grew (more copies of one paragraph). A latent problem (shown False: a
+        record without a Status line in a domain that has none) is existing debt once the domain adopts the rule."""
+        p, out, domains = [], [], self._domains()
         for r in self._q('SELECT s.note, s.heading, l.dst, l.anchor, l.dst_section, '
                          '(SELECT 1 FROM notes WHERE path = l.dst) AS found FROM links l '
                          'JOIN sections s ON s.id = l.src_section JOIN notes n ON n.path = s.note WHERE n.domain = ?', domain):
@@ -466,23 +473,25 @@ class Store:
                 norm = ' '.join(para.split())
                 if len(norm) >= DUP_MIN:
                     claims[norm].add(s['note'])
-        p += [f"same paragraph in {', '.join(sorted(notes))}: {norm[:80]}…" for norm, notes in claims.items() if len(notes) > 1]
+        out += [(('same paragraph', domain, norm), f"same paragraph in {', '.join(sorted(notes))}: {norm[:80]}…", len(notes), True)
+                for norm, notes in claims.items() if len(notes) > 1]
         recs = self._records(domain)
         ids = collections.Counter(r['id'] for r in recs)
         adopted = any(r['status'] for r in recs)  # a domain adopts the Status-line rule with its first Status line
         for r in recs:
             if ids[r['id']] > 1:
                 p.append(f"decision {r['id']} is recorded more than once")
-            if len(r['status']) > 1 or (adopted and not r['status']):
-                p.append(f"decision {r['id']} needs exactly one '- **Status:**' line (has {len(r['status'])})")
-            elif r['status'] and r['status'][0][1] and r['status'][0][1] not in ids:
+            if len(r['status']) != 1:
+                text = f"decision {r['id']} needs exactly one '- **Status:**' line (has {len(r['status'])})"
+                out.append((text, text, 1, bool(r['status']) or adopted))
+            elif r['status'][0][1] and r['status'][0][1] not in ids:
                 p.append(f"decision {r['id']} is superseded by unknown {r['status'][0][1]}")
         cutoff = (datetime.date.today() - datetime.timedelta(days=STALE_DAYS)).isoformat()
         for r in self._q('SELECT n.path, n.verified_at, src.id FROM note_sources ns JOIN sources src ON src.id = ns.source '
                          'JOIN notes n ON n.path = ns.note WHERE n.domain = ? AND src.verify_live = 1', domain):
             if not r['verified_at'] or r['verified_at'][:10] < cutoff:
                 p.append(f"{r['path']} cites live source {r['id']}; verified_at {r['verified_at'] or 'missing'} is older than {STALE_DAYS} days")
-        return p
+        return [(text, text, 1, True) for text in p] + out
 
     # ---------- tools ----------
 
@@ -667,7 +676,7 @@ class Store:
         """Replace a section's subtree with parsed text; existing subsections keep their ids. Returns changed ids."""
         base = t['level'] or 0
         own, children, _ = parse_sections(text, base, json.loads(t['heading_path']))
-        if t['level'] is None and children:
+        if t['level'] is None and children and len(self._sections(t['note'])) > 1:  # a root-only page may get its first headings
             raise Refused('headings_not_allowed', hint='the text before the first heading cannot contain headings')
         old = {r['heading_path']: r for r in rows[1:]}
         changed, order = [], [t['id']]
